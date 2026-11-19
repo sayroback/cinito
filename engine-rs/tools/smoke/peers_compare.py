@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Compare public swarms, one host at a time, with 5-second diagnostics.
+
+Usage: peers_compare.py <engine-host> <label: go-*|rust-*> <magnet> <seconds>
+Ubuntu magnet: magnet:?xt=urn:btih:d160b8d8ea35a5b4e52837468fc8f03d55cef1f7&tr=https%3A%2F%2Ftorrent.ubuntu.com%2Fannounce
+A result.json and host.log are retained in ~/.cache/wt-tmp/peers-<label>.
+Optional env: WT_BENCH_MAX_PEERS (55), WT_BENCH_HALF_OPEN (Rust host only),
+WT_BENCH_DIAL_RATE (30). Leave unset for the standard Go parity campaign.
+"""
+import collections
+import hashlib
+import re
+import datetime
+import json
+import os
+import pathlib
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+
+def main():
+    binary, label, magnet, seconds = sys.argv[1:]
+    max_peers = int(os.environ.get('WT_BENCH_MAX_PEERS', '55'))
+    half_open = os.environ.get('WT_BENCH_HALF_OPEN') if label.startswith('rust-') else None
+    # Go SettingsRequest.DialRatePerSec is *int; JSON 30.0 fails to decode.
+    dial_rate = int(float(os.environ.get('WT_BENCH_DIAL_RATE', '30')))
+    if not 1 <= max_peers <= 500 or (half_open is not None and int(half_open) < 1):
+        raise ValueError('invalid benchmark peer limits')
+    seconds = int(seconds)
+    work = pathlib.Path.home() / '.cache/wt-tmp' / f'peers-{label}'
+    work.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(work / 'data', ignore_errors=True)
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    dash = '-' if label.startswith('go-') else '--'
+    result = {'label': label, 'requested_seconds': seconds, 'samples': [],
+              'started_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'requested_port': port, 'configured_max_peers': max_peers,
+              'requested_half_open': int(half_open) if half_open else None,
+              'dial_rate_per_sec': dial_rate}
+    if pathlib.Path(binary).is_file():
+        result['binary_sha256'] = hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()
+    stop = threading.Event()
+    process = None
+
+    def call(method, path, body=None, timeout=10):
+        call_started = time.monotonic()
+        req = urllib.request.Request(
+            f'http://127.0.0.1:{port}{path}', method=method,
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            payload = json.loads(response.read() or b'null')
+        if method == 'POST':
+            result.setdefault('setup_calls_s', {})[path] = round(time.monotonic() - call_started, 3)
+        return payload
+
+    try:
+        extra_args = ['--half-open-conns', half_open] if half_open else []
+        with open(work / 'host.log', 'wb') as log:
+            process = subprocess.Popen(
+                [binary, dash+'port', str(port), dash+'path', str(work / 'data'),
+                 dash+'max-peers', str(max_peers), *extra_args], stdout=log, stderr=subprocess.STDOUT,
+                env={**os.environ, 'WT_SWARM_DIAGNOSTICS': '1'})
+        ready_deadline = time.monotonic() + 20
+        while time.monotonic() < ready_deadline:
+            # Both hosts may fall back to an ephemeral listener if their preferred
+            # port was claimed after our free-port probe. Follow the actual port.
+            startup_log = (work / 'host.log').read_text(errors='replace')
+            actual = re.search(r'control listening on http://127\.0\.0\.1:(\d+)|ctlPort=(\d+)', startup_log)
+            if actual:
+                port = int(actual.group(1) or actual.group(2))
+                result['control_port'] = port
+            if process.poll() is not None:
+                raise RuntimeError(f'host exited during startup: {process.returncode}')
+            try:
+                call('GET', '/stats', timeout=1)
+                break
+            except (OSError, urllib.error.URLError):
+                time.sleep(0.1)
+        else:
+            raise RuntimeError('host did not become ready in 20 seconds')
+        call('POST', '/settings', {
+            'maxPeers': max_peers, 'dialRatePerSec': dial_rate, 'peerExploration': True,
+            'claudeSeekMode': True, 'hedgeRequests': True, 'slowPeerYield': True,
+            'dropChokers': True, 'seedingEnabled': True,
+        })
+        started = torrent_started = time.monotonic()
+        tid = call('POST', '/add', {'torrentId': magnet, 'prepare': True})['id']
+        while True:
+            status = call('GET', f'/torrent/{tid}')
+            if status.get('ready') or time.monotonic() - started > 90:
+                break
+            time.sleep(0.5)
+        result['metadata_s'] = round(time.monotonic() - started, 2)
+        files = status.get('files') or []
+        if not status.get('ready') or not files:
+            result['torrent'] = status
+            raise RuntimeError('metadata unavailable after 90 seconds')
+        index = max(files, key=lambda f: f['length'])['index']
+        call('POST', '/configure', {
+            'id': tid, 'descriptors': [None] * len(files), 'selected': [index],
+            'storageMode': 'stream', 'streamCacheBytes': 64 << 20,
+        }, timeout=70)
+        call('POST', '/focus', {'id': tid, 'fileIndex': index})
+        play = call('POST', '/play', {'id': tid, 'fileIndex': index, 'offset': 0})
+        reader_state = {'bytes': 0}
+
+        def reader():
+            try:
+                with urllib.request.urlopen(play['streamUrl'], timeout=120) as response:
+                    while not stop.is_set():
+                        chunk = response.read(1 << 16)
+                        if not chunk:
+                            break
+                        reader_state['bytes'] += len(chunk)
+            except Exception as error:
+                reader_state['error'] = str(error)
+
+        threading.Thread(target=reader, daemon=True).start()
+        started = time.monotonic()
+        result['setup_s'] = round(started - torrent_started, 3)
+        with open(work / 'diagnostics.jsonl', 'w') as diagnostics:
+            for sample_at in range(5, seconds + 1, 5):
+                stop.wait(max(0, started + sample_at - time.monotonic()))
+                status = call('GET', f'/torrent/{tid}')
+                conns = call('GET', f'/connections/{tid}')
+                peers = conns.get('peers') or []
+                top = sorted(peers, key=lambda p: p.get('downloadRate', 0), reverse=True)[:5]
+                sample = {
+                    'elapsed_s': round(time.monotonic() - started, 2),
+                    'elapsed_since_add_s': round(time.monotonic() - torrent_started, 2),
+                    'peers': status.get('numPeers', 0),
+                    'mib_s': round(status.get('downloadSpeed', 0) / 2**20, 3),
+                    'downloaded': status.get('downloaded', 0),
+                    'top5': top, 'swarm': conns.get('diagnostics'),
+                    'reader': dict(reader_state),
+                }
+                result['samples'].append(sample)
+                diagnostics.write(json.dumps(sample) + '\n')
+                diagnostics.flush()
+                print(json.dumps({'label': label, 'sample': sample}), flush=True)
+        samples = result['samples']
+        result['peers_speed_every_5s'] = [[s['peers'], s['mib_s']] for s in samples]
+        result['avg_mib_s'] = round(sum(s['mib_s'] for s in samples) / len(samples), 3)
+        result['peak_mib_s'] = max(s['mib_s'] for s in samples)
+        result['peers_min_max'] = [min(s['peers'] for s in samples), max(s['peers'] for s in samples)]
+        result['conn_summary'] = {
+            'n': len(peers), 'transports': dict(collections.Counter(p.get('transport') for p in peers)),
+            'downloaded_gt0': sum(p.get('downloaded', 0) > 0 for p in peers),
+            'total_downloaded': sum(p.get('downloaded', 0) for p in peers),
+        }
+        result['reader'] = dict(reader_state)
+        result['trackers'] = status.get('trackers')
+    except Exception as error:
+        result['error'] = f'{type(error).__name__}: {error}'
+    finally:
+        stop.set()
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            result['host_exit_code'] = process.returncode
+        shutil.rmtree(work / 'data', ignore_errors=True)
+        (work / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+        print(json.dumps(result), flush=True)
+    return 2 if 'error' in result else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

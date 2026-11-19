@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Public internet cleartext HTTP is blocked in HardenedNetworkClient (Kotlin OkHttp interceptor);
+         LAN/loopback cleartext is enabled at OS level only for local engine HTTP, LAN Torznab, and DLNA Smart TVs. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

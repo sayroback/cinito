@@ -1,0 +1,291 @@
+package webtor.app
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import org.cinito.online.MainActivity
+
+/**
+ * Owns the active-transfer notification independently from the Activity task.
+ * The sticky foreground service keeps downloads alive after the Activity task
+ * is removed. Paused downloads do not keep a service or notification alive.
+ */
+class PlayService : Service() {
+    private var title: String = "CiniTo"
+    private var text: String = "Restoring downloads…"
+    private var progress: Int = 0
+    private var paused: Boolean = false
+    private var isMultiple: Boolean = false
+    private var playbackOnly: Boolean = false
+    private var castActive: Boolean = false
+    // Live playback stats (seek time), shown expanded.
+    private var stats: String = ""
+    // Off once nothing has moved for a while, so a stalled download sleeps.
+    private var holdLocks: Boolean = true
+    // With the screen off Android lets the CPU sleep and puts Wi-Fi into
+    // power save, which throttles transfers. Held only while this runs.
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    // Lets the engine hear local peers' discovery announces (BEP 14).
+    private var multicastLock: WifiManager.MulticastLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        applyExtras(intent)
+        return when (intent?.action) {
+            ACTION_REFRESH -> {
+                showForeground(notification(commandInProgress = false))
+                val session = (application as? WebtorApp)?.session
+                if (session == null) stop(this) else session.refreshTransferNotification()
+                START_NOT_STICKY
+            }
+            ACTION_STOP -> {
+                text = if (isMultiple) "Pausing downloads…" else "Pausing download…"
+                showForeground(notification(commandInProgress = true))
+                val session = (application as? WebtorApp)?.session
+                if (session == null) stop(this) else session.pauseFromNotification()
+                START_NOT_STICKY
+            }
+            else -> {
+                val current = notification(commandInProgress = false)
+                if (showForeground(current)) START_STICKY else START_NOT_STICKY
+            }
+        }
+    }
+
+    // Android 15+ allows dataSync services 6 hours in the background per day.
+    // Stop in time or the system kills the app; opening the app resets it.
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        notifyTimedOut(this)
+        // Without this the session asks for the service again a second later.
+        runCatching { (application as? WebtorApp)?.session?.onServiceTimeout() }
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        releaseTransferLocks()
+        if (Build.VERSION.SDK_INT >= 24) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        getSystemService(NotificationManager::class.java).cancel(NOTIF_ID)
+        super.onDestroy()
+    }
+
+    private fun holdTransferLocks() {
+        if (wakeLock == null) {
+            wakeLock = runCatching {
+                getSystemService(PowerManager::class.java)
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "webtor:transfers")
+                    .apply { setReferenceCounted(false); acquire() }
+            }.getOrNull()
+        }
+        if (wifiLock == null) {
+            wifiLock = runCatching {
+                @Suppress("DEPRECATION")
+                applicationContext.getSystemService(WifiManager::class.java)
+                    .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "webtor:transfers")
+                    .apply { setReferenceCounted(false); acquire() }
+            }.getOrNull()
+        }
+        if (multicastLock == null) {
+            multicastLock = runCatching {
+                applicationContext.getSystemService(WifiManager::class.java)
+                    .createMulticastLock("webtor:lsd")
+                    .apply { setReferenceCounted(false); acquire() }
+            }.getOrNull()
+        }
+    }
+
+    private fun releaseTransferLocks() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
+        multicastLock?.let { if (it.isHeld) it.release() }
+        multicastLock = null
+    }
+
+    private fun applyExtras(intent: Intent?) {
+        intent?.getStringExtra(EXTRA_TITLE)?.let { title = it }
+        intent?.getStringExtra(EXTRA_TEXT)?.let { text = it }
+        if (intent?.hasExtra(EXTRA_PROGRESS) == true) {
+            progress = intent.getIntExtra(EXTRA_PROGRESS, 0).coerceIn(0, 100)
+        }
+        if (intent?.hasExtra(EXTRA_PAUSED) == true) {
+            paused = intent.getBooleanExtra(EXTRA_PAUSED, false)
+        }
+        if (intent?.hasExtra(EXTRA_HOLD_LOCKS) == true) holdLocks = intent.getBooleanExtra(EXTRA_HOLD_LOCKS, true)
+        if (intent?.hasExtra(EXTRA_STATS) == true) stats = intent.getStringExtra(EXTRA_STATS).orEmpty()
+        if (intent?.hasExtra(EXTRA_PLAYBACK_ONLY) == true) playbackOnly = intent.getBooleanExtra(EXTRA_PLAYBACK_ONLY, false)
+        if (intent?.hasExtra(EXTRA_CAST_ACTIVE) == true) castActive = intent.getBooleanExtra(EXTRA_CAST_ACTIVE, false)
+        if (intent?.hasExtra(EXTRA_MULTIPLE) == true) {
+            isMultiple = intent.getBooleanExtra(EXTRA_MULTIPLE, false)
+        }
+    }
+
+    private fun showForeground(value: Notification): Boolean = runCatching {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val fgsType = when {
+                castActive && playbackOnly -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                castActive -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                else -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            }
+            startForeground(NOTIF_ID, value, fgsType)
+        } else {
+            startForeground(NOTIF_ID, value)
+        }
+        if (holdLocks) holdTransferLocks() else releaseTransferLocks()
+        true
+    }.getOrElse {
+        stopSelf()
+        false
+    }
+
+    private fun notification(commandInProgress: Boolean): Notification {
+        createChannel()
+        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        val open = PendingIntent.getActivity(
+            this,
+            REQUEST_OPEN,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            flags,
+        )
+        val stop = serviceAction(ACTION_STOP, REQUEST_STOP, flags)
+        val stopLabel = if (isMultiple) "Stop all" else "Stop"
+
+        return NotificationCompat.Builder(this, CHANNEL)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(if (playbackOnly || castActive) android.R.drawable.ic_media_play else android.R.drawable.stat_sys_download)
+            .setContentIntent(open)
+            .setDeleteIntent(serviceAction(ACTION_REFRESH, REQUEST_REFRESH, flags))
+            .setCategory(if (castActive || playbackOnly) NotificationCompat.CATEGORY_TRANSPORT else NotificationCompat.CATEGORY_PROGRESS)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setProgress(if (playbackOnly) 0 else 100, if (playbackOnly) 0 else progress, false)
+            .apply {
+                if (stats.isNotEmpty()) setStyle(NotificationCompat.BigTextStyle().bigText("$text\n$stats"))
+            }
+            .apply {
+                if (!commandInProgress && !playbackOnly) {
+                    addAction(android.R.drawable.ic_menu_close_clear_cancel, stopLabel, stop)
+                }
+            }
+            .build()
+    }
+
+    private fun serviceAction(action: String, requestCode: Int, flags: Int): PendingIntent {
+        val intent = Intent(this, PlayService::class.java)
+            .setAction(action)
+            .putExtra(EXTRA_TITLE, title)
+            .putExtra(EXTRA_TEXT, text)
+            .putExtra(EXTRA_PROGRESS, progress)
+            .putExtra(EXTRA_PAUSED, paused)
+            .putExtra(EXTRA_MULTIPLE, isMultiple)
+            .putExtra(EXTRA_PLAYBACK_ONLY, playbackOnly)
+            .putExtra(EXTRA_CAST_ACTIVE, castActive)
+            .putExtra(EXTRA_HOLD_LOCKS, holdLocks)
+            .putExtra(EXTRA_STATS, stats)
+        return PendingIntent.getForegroundService(this, requestCode, intent, flags)
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT < 26) return
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL, "Downloads", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Torrent download progress and controls"
+                setShowBadge(false)
+            },
+        )
+    }
+
+    companion object {
+        fun notifyCompleted(ctx: Context, entry: DownloadEntry) {
+            runCatching {
+                val manager = ctx.getSystemService(NotificationManager::class.java)
+                if (Build.VERSION.SDK_INT >= 33 && manager.areNotificationsEnabled().not()) return
+                val channel = NotificationChannel("webtor-complete", "Completed downloads", NotificationManager.IMPORTANCE_DEFAULT)
+                manager.createNotificationChannel(channel)
+                val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                val open = PendingIntent.getActivity(ctx, entry.key.hashCode(), Intent(ctx, MainActivity::class.java).putExtra("open_key", entry.key), flags)
+                manager.notify(entry.key.hashCode(), NotificationCompat.Builder(ctx, "webtor-complete").setSilent(true).setOnlyAlertOnce(true).setSmallIcon(android.R.drawable.stat_sys_download_done).setContentTitle("Download complete").setContentText("A download is ready").setContentIntent(open).setAutoCancel(true).build())
+            }
+        }
+        private fun notifyTimedOut(ctx: Context) {
+            runCatching {
+                val manager = ctx.getSystemService(NotificationManager::class.java)
+                if (Build.VERSION.SDK_INT >= 33 && manager.areNotificationsEnabled().not()) return
+                manager.createNotificationChannel(NotificationChannel("webtor-complete", "Completed downloads", NotificationManager.IMPORTANCE_DEFAULT))
+                val open = PendingIntent.getActivity(ctx, REQUEST_OPEN, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                manager.notify(NOTIF_TIMEOUT_ID, NotificationCompat.Builder(ctx, "webtor-complete").setSilent(true).setSmallIcon(android.R.drawable.stat_sys_warning).setContentTitle("Transfers stopped in the background").setContentText("Android allows 6 hours a day. Open CiniTo to continue.").setContentIntent(open).setAutoCancel(true).build())
+            }
+        }
+        const val ACTION_STOP = "webtor.app.STOP"
+        private const val ACTION_REFRESH = "webtor.app.REFRESH_NOTIFICATION"
+        const val EXTRA_TITLE = "title"
+        const val EXTRA_TEXT = "text"
+        const val EXTRA_PROGRESS = "progress"
+        const val EXTRA_PAUSED = "paused"
+        const val EXTRA_MULTIPLE = "multiple"
+        private const val EXTRA_PLAYBACK_ONLY = "playbackOnly"
+        private const val EXTRA_CAST_ACTIVE = "castActive"
+        private const val EXTRA_HOLD_LOCKS = "holdLocks"
+        private const val EXTRA_STATS = "stats"
+        private const val CHANNEL = "webtor-downloads"
+        private const val NOTIF_ID = 42
+        private const val NOTIF_TIMEOUT_ID = 43
+        private const val REQUEST_OPEN = 0
+        private const val REQUEST_STOP = 3
+        private const val REQUEST_REFRESH = 4
+
+        fun start(
+            ctx: Context,
+            title: String,
+            progress: Int = 0,
+            paused: Boolean = false,
+            text: String = "Downloading",
+            multiple: Boolean = false,
+            playbackOnly: Boolean = false,
+            stats: String = "",
+            holdLocks: Boolean = true,
+            castActive: Boolean = false,
+        ) {
+            val intent = Intent(ctx, PlayService::class.java)
+                .putExtra(EXTRA_HOLD_LOCKS, holdLocks)
+                .putExtra(EXTRA_TITLE, title)
+                .putExtra(EXTRA_PROGRESS, progress)
+                .putExtra(EXTRA_PAUSED, paused)
+                .putExtra(EXTRA_TEXT, text)
+                .putExtra(EXTRA_MULTIPLE, multiple)
+                .putExtra(EXTRA_PLAYBACK_ONLY, playbackOnly)
+                .putExtra(EXTRA_CAST_ACTIVE, castActive)
+                .putExtra(EXTRA_STATS, stats)
+            runCatching { ContextCompat.startForegroundService(ctx, intent) }
+        }
+
+        fun stop(ctx: Context) {
+            ctx.getSystemService(NotificationManager::class.java).cancel(NOTIF_ID)
+            ctx.stopService(Intent(ctx, PlayService::class.java))
+        }
+    }
+}

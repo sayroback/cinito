@@ -1,0 +1,17 @@
+{
+  "id": "org.cinito.tv",
+  "version": "0.1.3",
+  "vendor": "CiniTo",
+  "type": "web",
+  "main": "assets/webos_receiver/index.html",
+  "title": "CiniTo TV",
+  "icon": "icon80.png",
+  "largeIcon": "icon130.png",
+  "bgColor": "#0B0D12",
+  "iconColor": "#5B8CFF",
+  "handlesRelaunch": true,
+  "disableBackHistoryAPI": true,
+  "transparent": false,
+  "resolution": "1920x1080",
+  "requiredACG": []
+}

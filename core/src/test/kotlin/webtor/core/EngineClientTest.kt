@@ -1,0 +1,857 @@
+package webtor.core
+
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.text.Charsets
+import org.json.JSONObject
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+
+private class TestResponse {
+    var statusCode: Int = 200
+    var body: String = ""
+
+    fun setResponseCode(value: Int) = apply { statusCode = value }
+    fun setBody(value: String) = apply { body = value }
+}
+
+private class RecordedBody(private val value: String) {
+    fun readUtf8(): String = value
+}
+
+private data class RecordedRequest(
+    val path: String,
+    val body: RecordedBody,
+)
+
+private class FakeEngineTransport : EngineTransport {
+    private val responses = ArrayDeque<TestResponse>()
+    private val rawResponses = ArrayDeque<EngineBytesResponse>()
+    private val requests = ArrayDeque<RecordedRequest>()
+
+    fun enqueue(response: TestResponse) { responses.addLast(response) }
+    fun enqueueRaw(response: EngineBytesResponse) { rawResponses.addLast(response) }
+    fun takeRequest(): RecordedRequest = requests.removeFirst()
+
+    override fun request(method: String, path: String, body: String?): EngineResponse {
+        requests.addLast(RecordedRequest(path, RecordedBody(body.orEmpty())))
+        val response = responses.removeFirst()
+        return EngineResponse(response.statusCode, response.body)
+    }
+
+    override fun requestRaw(method: String, path: String, body: ByteArray?): EngineBytesResponse {
+        requests.addLast(RecordedRequest(path, RecordedBody(body?.toString(Charsets.UTF_8).orEmpty())))
+        if (rawResponses.isNotEmpty()) return rawResponses.removeFirst()
+        // Unit tests that only enqueue JSON keep using /pieces fallback.
+        return EngineBytesResponse(404, ByteArray(0))
+    }
+}
+
+class EngineClientTest {
+    @Test
+    fun forgetPeerHintsPostsTheInfoHash() {
+        val client = EngineClient { method, path, body ->
+            assertEquals("POST", method)
+            assertEquals("/forget-peers", path)
+            assertEquals("abcd", JSONObject(body!!).getString("infoHash"))
+            EngineResponse(200, """{"ok":true}""")
+        }
+        client.forgetPeerHints("abcd")
+    }
+
+    @Test fun previewStateUsesNativePlaybackAndCacheSnapshot() {
+        val client = EngineClient { method, path, _ ->
+            assertEquals("GET", method)
+            assertEquals("/preview-state/movie?fileIndex=2", path)
+            EngineResponse(200, """{"active":true,"byteOffset":10485760,"signature":"9a2"}""")
+        }
+        val state = client.previewState("movie", 2)
+        assertTrue(state.active)
+        assertEquals(10485760L, state.byteOffset)
+        assertEquals("9a2", state.signature)
+    }
+    @Test
+    fun connectionsReadsNativeSnapshotAndHandlesEmptyPausedList() {
+        transport.enqueue(TestResponse().setBody(
+            """{"id":"abc","paused":false,"peers":[{"address":"8.8.8.8:1234","transport":"TCP","client":"Local peer","downloaded":4096,"uploaded":1024,"country":"US"}]}""",
+        ))
+        val snapshot = client.connections("abc")
+        assertEquals("/connections/abc", transport.takeRequest().path)
+        assertFalse(snapshot.paused)
+        assertEquals("8.8.8.8:1234", snapshot.peers.single().address)
+        assertEquals("US", snapshot.peers.single().country)
+        assertEquals(4096L, snapshot.peers.single().downloaded)
+        assertEquals(1024L, snapshot.peers.single().uploaded)
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","paused":true,"peers":[]}"""))
+        val paused = client.connections("abc")
+        assertTrue(paused.paused)
+        assertTrue(paused.peers.isEmpty())
+        assertEquals(null, paused.holepunch)
+    }
+
+    @Test
+    fun connectionsCarriesPerTorrentHolepunch() {
+        transport.enqueue(TestResponse().setBody(
+            """{"id":"abc","paused":false,"peers":[],"holepunch":{"rendezvousSent":1,"punchDialsAttempted":2,"punchDialsSucceeded":1}}""",
+        ))
+        val snapshot = client.connections("abc")
+        assertEquals(HolepunchStats(rendezvousSent = 1, punchDialsAttempted = 2, punchDialsSucceeded = 1), snapshot.holepunch)
+    }
+
+    @Test
+    fun parseConnectedSeedersAndSwarmAvailabilityAndDefaultNullForOlderEngine() {
+        val modern = EngineClient.parseTorrent(JSONObject(
+            """{"id":"a","connectedSeeders":5,"swarmAvailability":4.25}""",
+        ))
+        assertEquals(5, modern.connectedSeeders)
+        assertEquals(4.25, modern.swarmAvailability!!, 0.0001)
+
+        val older = EngineClient.parseTorrent(JSONObject("""{"id":"b"}"""))
+        assertNull(older.connectedSeeders)
+        assertNull(older.swarmAvailability)
+    }
+
+    @Test
+    fun parseCheckingProgressAndDefaultForOlderStatus() {
+        val checking = EngineClient.parseTorrent(JSONObject(
+            """{"id":"a","checking":true,"checkedPieces":7,"checkTotal":20}""",
+        ))
+        assertTrue(checking.checking)
+        assertEquals(7, checking.checkedPieces)
+        assertEquals(20, checking.checkTotal)
+        assertFalse(EngineClient.parseTorrent(JSONObject("""{"id":"a"}""")).checking)
+    }
+
+    @Test
+    fun parseNextPreloadAndSendNextEpisode() {
+        val warming = EngineClient.parseTorrent(JSONObject(
+            """{"id":"a","nextPreload":{"fileIndex":2,"active":true,"ready":false}}""",
+        ))
+        assertEquals(NextPreload(2, active = true, ready = false), warming.nextPreload)
+        assertEquals(null, EngineClient.parseTorrent(JSONObject("""{"id":"a"}""")).nextPreload)
+
+        transport.enqueue(TestResponse().setBody("""{"id":"a","fileIndex":1,"name":"e1.mkv","length":10,"streamUrl":"http://x"}"""))
+        client.play("a", 1, nextFileIndex = 2)
+        val body = JSONObject(transport.takeRequest().body.readUtf8())
+        assertEquals(2, body.getInt("nextFileIndex"))
+        transport.enqueue(TestResponse().setBody("""{"id":"a","fileIndex":1,"name":"e1.mkv","length":10,"streamUrl":"http://x"}"""))
+        client.play("a", 1)
+        assertFalse(JSONObject(transport.takeRequest().body.readUtf8()).has("nextFileIndex"))
+    }
+
+    @Test
+    fun parseDirectPlayIdleFieldsAndIdleSetting() {
+        val resting = EngineClient.parseTorrent(JSONObject(
+            """{"id":"a","playbackReaders":1,"resting":true,"idleDropReady":false}""",
+        ))
+        assertEquals(1, resting.playbackReaders)
+        assertTrue(resting.resting)
+        assertFalse(resting.idleDropReady)
+        val older = EngineClient.parseTorrent(JSONObject("""{"id":"a"}"""))
+        assertEquals(0, older.playbackReaders)
+        assertFalse(older.resting || older.idleDropReady)
+
+        transport.enqueue(TestResponse().setBody("""{"idleDropMinutes":30}"""))
+        assertEquals(30, client.setIdleDropMinutes(30))
+        assertEquals("{\"idleDropMinutes\":30}", transport.takeRequest().body.readUtf8())
+    }
+
+    @Test
+    fun seekLogSettingSendsPathAndBuild() {
+        transport.enqueue(TestResponse().setBody("""{}"""))
+        client.setSeekLog("/sdcard/Android/data/webtor.app/files/seek-log.csv", "2.1.45", experiment = true)
+        val body = JSONObject(transport.takeRequest().body.readUtf8())
+        assertEquals("/sdcard/Android/data/webtor.app/files/seek-log.csv", body.getString("seekLogPath"))
+        assertEquals("2.1.45", body.getString("seekLogTag"))
+        assertTrue(body.getBoolean("seekExperiment"))
+    }
+
+    private lateinit var transport: FakeEngineTransport
+    private lateinit var client: EngineClient
+
+    @BeforeEach
+    fun setUp() {
+        transport = FakeEngineTransport()
+        client = EngineClient(transport)
+    }
+
+    @Test
+    fun statsParsesPorts() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"downloadSpeed":1,"uploadSpeed":2,"progress":0.5,"ratio":1.2,
+                    "torrents":1,"ctlPort":0,"streamPort":8000,"path":"/tmp"}"""
+            )
+        )
+        val s = client.stats()
+        assertEquals(0, s.ctlPort)
+        assertEquals(8000, s.streamPort)
+        assertEquals(1L, s.downloadSpeed)
+        assertEquals(0, s.listenPort)
+
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"downloadSpeed":1,"uploadSpeed":2,"progress":0.5,"ratio":1.2,
+                    "torrents":1,"ctlPort":0,"streamPort":8000,"path":"/tmp","listenPort":6881}"""
+            )
+        )
+        assertEquals(6881, client.stats().listenPort)
+    }
+
+    @Test
+    fun playSendsOptionalResumeByteHint() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","fileIndex":2,"name":"a.mp4","length":100,"streamUrl":"http://127.0.0.1:8000/x"}"""))
+        client.play("abc", 2, 75L)
+        val request = transport.takeRequest()
+        assertEquals("/play", request.path)
+        val json = JSONObject(request.body.readUtf8())
+        assertEquals(2, json.getInt("fileIndex"))
+        assertEquals(75L, json.getLong("offset"))
+        assertFalse(json.has("boost"))
+        assertFalse(json.has("adaptiveBuffer"))
+        assertFalse(json.has("burstAwareBuffer"))
+    }
+
+    @Test
+    fun playIncludesBoostOnlyWhenEnabled() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","fileIndex":1,"name":"a.mp4","length":100,"streamUrl":"http://127.0.0.1:8000/x"}"""))
+        client.play("abc", 1, null, false)
+        val disabled = JSONObject(transport.takeRequest().body.readUtf8())
+        assertFalse(disabled.has("boost"))
+        assertFalse(disabled.has("fileOnly"))
+
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","fileIndex":1,"name":"a.mp4","length":100,"streamUrl":"http://127.0.0.1:8000/x"}"""))
+        client.play("abc", 1, null, true)
+        val enabled = JSONObject(transport.takeRequest().body.readUtf8())
+        assertTrue(enabled.getBoolean("boost"))
+        assertFalse(enabled.has("offset"))
+    }
+
+    @Test
+    fun fileOnlyPlaybackCanBeEnabledAndCleared() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","fileIndex":1,"name":"a.mp4","length":100,"streamUrl":"http://127.0.0.1:8000/x"}"""))
+        client.play("abc", 1, fileOnly = true)
+        val play = transport.takeRequest()
+        assertEquals("/play", play.path)
+        assertTrue(JSONObject(play.body.readUtf8()).getBoolean("fileOnly"))
+
+        transport.enqueue(TestResponse().setBody("""{"fileOnly":false}"""))
+        client.clearFileOnly("abc")
+        val clear = transport.takeRequest()
+        assertEquals("/file-only", clear.path)
+        val body = JSONObject(clear.body.readUtf8())
+        assertEquals("abc", body.getString("id"))
+        assertFalse(body.getBoolean("enabled"))
+    }
+
+    @Test
+    fun playCanOptIntoAdaptiveBuffering() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","fileIndex":1,"name":"a.mp4","length":100,"streamUrl":"http://127.0.0.1:8000/x"}"""))
+        client.play("abc", 1, adaptiveBuffer = true)
+        val request = transport.takeRequest()
+        assertEquals("/play", request.path)
+        val body = JSONObject(request.body.readUtf8())
+        assertTrue(body.getBoolean("adaptiveBuffer"))
+        assertFalse(body.has("boost"))
+    }
+
+    @Test
+    fun burstAwareBufferCanBeEnabledIndependently() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","fileIndex":1,"name":"a.mp4","length":100,"streamUrl":"http://127.0.0.1:8000/x"}"""))
+        client.play("abc", 1, burstAwareBuffer = true)
+        val request = transport.takeRequest()
+        assertEquals("/play", request.path)
+        val body = JSONObject(request.body.readUtf8())
+        assertTrue(body.getBoolean("burstAwareBuffer"))
+        assertFalse(body.has("adaptiveBuffer"))
+        assertFalse(body.has("boost"))
+    }
+
+    @Test
+    fun peerExplorationSettingOnlyChangesThatExperiment() {
+        for (enabled in listOf(true, false)) {
+            transport.enqueue(TestResponse().setBody("""{"peerExploration":$enabled}"""))
+            assertEquals(enabled, client.setPeerExploration(enabled))
+            val request = transport.takeRequest()
+            assertEquals("/settings", request.path)
+            val body = JSONObject(request.body.readUtf8())
+            assertEquals(enabled, body.getBoolean("peerExploration"))
+            assertEquals(1, body.length())
+        }
+    }
+
+    @Test
+    fun ghostModeCanBeToggledWithoutChangingOtherSettings() {
+        for (enabled in listOf(true, false)) {
+            transport.enqueue(TestResponse().setBody("""{"ghostMode":$enabled}"""))
+            assertEquals(enabled, client.setGhostMode(enabled))
+            val request = transport.takeRequest()
+            assertEquals("/settings", request.path)
+            val body = JSONObject(request.body.readUtf8())
+            assertEquals(enabled, body.getBoolean("ghostMode"))
+            assertEquals(1, body.length())
+        }
+    }
+
+    @Test
+    fun ghostProModeCanBeToggledWithoutChangingOtherSettings() {
+        for (enabled in listOf(true, false)) {
+            transport.enqueue(TestResponse().setBody("""{"ghostProMode":$enabled}"""))
+            assertEquals(enabled, client.setGhostProMode(enabled))
+            val request = transport.takeRequest()
+            assertEquals("/settings", request.path)
+            val body = JSONObject(request.body.readUtf8())
+            assertEquals(enabled, body.getBoolean("ghostProMode"))
+            assertEquals(1, body.length())
+        }
+    }
+
+    @Test
+    fun setDownloadRateBytesSecOmitsUploadRate() {
+        transport.enqueue(TestResponse().setBody("""{"downloadRateBytesSec":1048576,"uploadRateBytesSec":99}"""))
+        assertEquals(1048576L, client.setDownloadRateBytesSec(1024L * 1024L))
+        val request = transport.takeRequest()
+        assertEquals("/settings", request.path)
+        val body = JSONObject(request.body.readUtf8())
+        assertEquals(1048576L, body.getLong("downloadRateBytesSec"))
+        assertFalse(body.has("uploadRateBytesSec"))
+        assertEquals(1, body.length())
+    }
+
+    @Test
+    fun setDialRatePerSecPostsOnlyDialRate() {
+        transport.enqueue(TestResponse().setBody("""{"dialRatePerSec":40}"""))
+        assertEquals(40, client.setDialRatePerSec(40))
+        val request = transport.takeRequest()
+        assertEquals("/settings", request.path)
+        val body = JSONObject(request.body.readUtf8())
+        assertEquals(40, body.getInt("dialRatePerSec"))
+        assertFalse(body.has("uploadRateBytesSec"))
+        assertFalse(body.has("downloadRateBytesSec"))
+        assertEquals(1, body.length())
+
+        transport.enqueue(TestResponse().setBody("{}"))
+        assertEquals(80, client.setDialRatePerSec(200))
+        val high = JSONObject(transport.takeRequest().body.readUtf8())
+        assertEquals(80, high.getInt("dialRatePerSec"))
+        assertFalse(high.has("uploadRateBytesSec"))
+        assertFalse(high.has("downloadRateBytesSec"))
+
+        transport.enqueue(TestResponse().setBody("{}"))
+        assertEquals(10, client.setDialRatePerSec(1))
+        val low = JSONObject(transport.takeRequest().body.readUtf8())
+        assertEquals(10, low.getInt("dialRatePerSec"))
+        assertFalse(low.has("uploadRateBytesSec"))
+        assertFalse(low.has("downloadRateBytesSec"))
+    }
+
+    @Test
+    fun addAndPlay() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","infoHash":"dead"}"""))
+        val added = client.add("magnet:?xt=urn:btih:dead")
+        assertEquals("abc", added.id)
+
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"id":"abc","fileIndex":0,"name":"a.mp4","length":12,
+                    "streamUrl":"http://127.0.0.1:8000/webtorrent/dead/a.mp4"}"""
+            )
+        )
+        val play = client.play("abc")
+        assertTrue(play.streamUrl.startsWith("http://127.0.0.1:"))
+        assertEquals("/add", transport.takeRequest().path)
+        assertEquals("/play", transport.takeRequest().path)
+    }
+
+    @Test
+    fun notFoundThrows() {
+        transport.enqueue(TestResponse().setResponseCode(404).setBody("""{"error":"torrent not found"}"""))
+        val ex = assertThrows<EngineException> { client.torrent("nope") }
+        assertTrue(ex.message!!.contains("404"))
+    }
+
+    @Test
+    fun torrentParsesStatusFields() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"id":"abc","infoHash":"dead","name":"n","ready":true,"done":false,
+                    "paused":true,"progress":0.25,"downloadSpeed":10,"uploadSpeed":2,
+                    "numPeers":3,"length":100,"downloaded":25,"uploaded":4,
+                    "timeRemaining":90000,"configured":true,"selected":[0,2],
+                    "files":[{"index":0,"name":"a.mp4","path":"a.mp4","length":50,"progress":0.5,"type":"video/mp4"}],
+                    "trackers":[{"url":"udp://tracker.example.org:1337/announce","tier":0,"status":"working","message":"3 peers","original":true},
+                                {"url":"wss://tracker.example.org","tier":1,"status":"error","message":"timeout","original":false}],
+                    "error":"slow"}"""
+            )
+        )
+        val t = client.torrent("abc")
+        assertEquals(90000L, t.timeRemaining)
+        assertTrue(t.configured)
+        assertEquals(listOf(0, 2), t.selected)
+        assertTrue(t.paused)
+        assertEquals("slow", t.error)
+        assertEquals(2, t.trackers.size)
+        assertEquals("udp://tracker.example.org:1337/announce", t.trackers[0].url)
+        assertEquals("working", t.trackers[0].status)
+        assertEquals("3 peers", t.trackers[0].message)
+        assertTrue(t.trackers[0].original)
+        assertEquals("error", t.trackers[1].status)
+        assertFalse(t.trackers[1].original)
+        assertEquals("/torrent/abc", transport.takeRequest().path)
+    }
+
+    @Test
+    fun progressClampsAndRejectsNonFiniteValues() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"id":"abc","progress":"NaN","files":[{"index":0,"name":"a.bin","path":"a.bin","length":10,"progress":2}]}"""
+            )
+        )
+        val t = client.torrent("abc")
+        assertEquals(0.0, t.progress)
+        assertEquals(1.0, t.files[0].progress)
+    }
+
+    @Test
+    fun torrentDefaultsMissingFields() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc"}"""))
+        val t = client.torrent("abc")
+        assertNull(t.timeRemaining)
+        assertFalse(t.configured)
+        assertEquals(emptyList<Int>(), t.selected)
+        assertFalse(t.paused)
+        assertNull(t.error)
+        assertEquals(emptyList<TrackerStatus>(), t.trackers)
+    }
+
+    @Test
+    fun addPrepareSendsFlag() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","infoHash":"dead"}"""))
+        client.add("magnet:?xt=urn:btih:dead", prepare = true)
+        val req = transport.takeRequest()
+        assertEquals("/add", req.path)
+        val body = JSONObject(req.body.readUtf8())
+        assertEquals("magnet:?xt=urn:btih:dead", body.getString("torrentId"))
+        assertTrue(body.getBoolean("prepare"))
+    }
+
+    @Test
+    fun selectSendsIndexes() {
+        transport.enqueue(TestResponse().setBody("""{"ok":true,"selected":[0,2]}"""))
+        client.select("abc", setOf(0, 2))
+        val req = transport.takeRequest()
+        assertEquals("/select", req.path)
+        val body = JSONObject(req.body.readUtf8())
+        assertEquals("abc", body.getString("id"))
+        val selected = mutableSetOf<Int>()
+        val selectedArr = body.getJSONArray("selected")
+        for (i in 0 until selectedArr.length()) selected.add(selectedArr.getInt(i))
+        assertEquals(setOf(0, 2), selected)
+    }
+
+    @Test
+    fun selectCanSendDescriptorsWhenAFileIsSelectedLater() {
+        transport.enqueue(TestResponse().setBody("""{"ok":true,"selected":[0,2]}"""))
+        client.select("abc", setOf(0, 2), listOf(11, null, 13))
+        val req = transport.takeRequest()
+        val body = JSONObject(req.body.readUtf8())
+        val descriptors = body.getJSONArray("descriptors")
+        assertEquals(11, descriptors.getInt(0))
+        assertTrue(descriptors.isNull(1))
+        assertEquals(13, descriptors.getInt(2))
+    }
+
+    @Test
+    fun configureSendsDescriptorsAndSelected() {
+        transport.enqueue(TestResponse().setBody("""{"ok":true}"""))
+        client.configure("abc", listOf(7, null, 9), setOf(0, 2))
+        val req = transport.takeRequest()
+        assertEquals("/configure", req.path)
+        val body = JSONObject(req.body.readUtf8())
+        assertEquals("abc", body.getString("id"))
+        assertEquals("download", body.getString("storageMode"))
+        val descriptors = body.getJSONArray("descriptors")
+        assertEquals(7, descriptors.getInt(0))
+        assertTrue(descriptors.isNull(1))
+        assertEquals(9, descriptors.getInt(2))
+        val selected = mutableSetOf<Int>()
+        val selectedArr = body.getJSONArray("selected")
+        for (i in 0 until selectedArr.length()) selected.add(selectedArr.getInt(i))
+        assertEquals(setOf(0, 2), selected)
+    }
+
+
+    @Test
+    fun pauseResumeRemoveHitPaths() {
+        transport.enqueue(TestResponse().setBody("""{"ok":true}"""))
+        client.pause("abc")
+        val pause = transport.takeRequest()
+        assertEquals("/pause", pause.path)
+        assertEquals("abc", JSONObject(pause.body.readUtf8()).getString("id"))
+
+        transport.enqueue(TestResponse().setBody("""{"ok":true}"""))
+        client.resume("abc")
+        val resume = transport.takeRequest()
+        assertEquals("/resume", resume.path)
+        assertEquals("abc", JSONObject(resume.body.readUtf8()).getString("id"))
+
+        transport.enqueue(TestResponse().setBody("""{"ok":true}"""))
+        client.remove("abc", destroyStore = false)
+        val remove = transport.takeRequest()
+        assertEquals("/remove", remove.path)
+        val body = JSONObject(remove.body.readUtf8())
+        assertEquals("abc", body.getString("id"))
+        assertFalse(body.getBoolean("destroyStore"))
+    }
+
+    @Test
+    fun metadataReturnsTorrentData() {
+        transport.enqueue(TestResponse().setBody("""{"torrentData":"d8:announce"}"""))
+        assertEquals("d8:announce", client.metadata("abc"))
+        assertEquals("/metadata/abc", transport.takeRequest().path)
+    }
+
+    @Test
+    fun setMaxPeersHitsSettings() {
+        transport.enqueue(TestResponse().setBody("""{"maxPeers":500}"""))
+        assertEquals(500, client.setMaxPeers(500))
+        val req = transport.takeRequest()
+        assertEquals("/settings", req.path)
+        assertEquals(500, JSONObject(req.body.readUtf8()).getInt("maxPeers"))
+    }
+
+    @Test
+    fun ramCacheSettingConvertsMiBToBytesAndReadsAppliedLimit() {
+        transport.enqueue(TestResponse().setBody("""{"ramCacheBytes":268435456}"""))
+        assertEquals(256, client.setRamCacheMiB(512))
+        val req = transport.takeRequest()
+        assertEquals("/settings", req.path)
+        assertEquals(536870912L, JSONObject(req.body.readUtf8()).getLong("ramCacheBytes"))
+    }
+
+    @Test
+    fun payloadTransferGateHitsSettingsWithoutChangingPauseIntent() {
+        transport.enqueue(TestResponse().setBody("""{"payloadTransfersAllowed":false}"""))
+        assertFalse(client.setPayloadTransfersAllowed(false))
+        val request = transport.takeRequest()
+        assertEquals("/settings", request.path)
+        assertFalse(JSONObject(request.body.readUtf8()).getBoolean("payloadTransfersAllowed"))
+    }
+
+    @Test
+    fun piecesParsesEveryPlaybackTierPlayheadsAndDetail() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"id":"abc","totalPieces":40,"pieceLength":1048576,"buckets":[],
+                    "playback":[{"start":8,"end":9,"priority":"B"},{"start":10,"end":11,"priority":"U"},
+                      {"start":12,"end":15,"priority":"N"},{"start":16,"end":30,"priority":"R"},
+                      {"start":31,"end":35,"priority":"L"},{"start":36,"end":36,"priority":"X"}],
+                    "playheads":[10],
+                    "playbackDetail":{"start":8,"states":"vvvrmmsv","playhead":10}}"""
+            )
+        )
+        val t = client.pieces("abc")
+        assertEquals(listOf("B", "U", "N", "R", "L"), t.playback.map { it.priority })
+        assertEquals(listOf(10), t.playheads)
+        assertEquals(PlaybackDetail(8, "vvvrmmsv", 10), t.playbackDetail)
+    }
+
+    @Test
+    fun piecesIgnoresAMalformedPlaybackDetail() {
+        transport.enqueue(TestResponse().setBody("""{"id":"abc","buckets":[],"playbackDetail":{"start":2,"states":"vqz"}}"""))
+        assertNull(client.pieces("abc").playbackDetail)
+    }
+
+    @Test
+    fun piecesParsesBucketsAndHitsPath() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"id":"abc","infoHash":"dead","generation":3,"timestamp":1700000000000,
+                    "totalPieces":4,"pieceLength":16384,"lastPieceLength":1024,"maxBuckets":256,
+                    "ghostProMode":true,"playback":[{"start":0,"end":0,"priority":"U"},{"start":1,"end":2,"priority":"R"},{"start":3,"end":3,"priority":"L"}],
+                    "buckets":[
+                      {"start":0,"end":1,"total":2,"selected":2,"verified":1,"receiving":1,"selectedVerified":1,"selectedReceiving":1},
+                      {"start":2,"end":3,"total":2,"selected":1,"verified":2,"receiving":0,"selectedVerified":1,"selectedReceiving":0}
+                    ]}"""
+            )
+        )
+        val t = client.pieces("abc", 256)
+        assertEquals("abc", t.id)
+        assertEquals("dead", t.infoHash)
+        assertEquals(3L, t.generation)
+        assertEquals(1700000000000L, t.timestamp)
+        assertEquals(4, t.totalPieces)
+        assertEquals(16384L, t.pieceLength)
+        assertEquals(1024L, t.lastPieceLength)
+        assertEquals(256, t.maxBuckets)
+        assertEquals(2, t.buckets.size)
+        assertTrue(t.ghostProMode)
+        assertEquals(listOf(PlaybackPieceRange(0, 0, "U"), PlaybackPieceRange(1, 2, "R"), PlaybackPieceRange(3, 3, "L")), t.playback)
+        val first = t.buckets[0]
+        assertEquals(0, first.start)
+        assertEquals(1, first.end)
+        assertEquals(2, first.total)
+        assertEquals(2, first.selected)
+        assertEquals(1, first.verified)
+        assertEquals(1, first.receiving)
+        assertEquals(1, first.selectedVerified)
+        assertEquals(1, first.selectedReceiving)
+        val second = t.buckets[1]
+        assertEquals(2, second.start)
+        assertEquals(3, second.end)
+        assertEquals(2, second.total)
+        assertEquals(1, second.selected)
+        assertEquals(2, second.verified)
+        assertEquals(0, second.receiving)
+        assertEquals(1, second.selectedVerified)
+        assertEquals(0, second.selectedReceiving)
+        assertEquals("/pieces-bin/abc?maxBuckets=256", transport.takeRequest().path)
+        assertEquals("/pieces/abc?maxBuckets=256", transport.takeRequest().path)
+    }
+
+    @Test
+    fun piecesPrefersBinarySnapshot() {
+        val encoded = encodePiecesBinForTest(
+            id = "abc",
+            infoHash = "dead",
+            generation = 3,
+            timestamp = 1_700_000_000_000L,
+            totalPieces = 4,
+            pieceLength = 16_384,
+            lastPieceLength = 1024,
+            maxBuckets = 256,
+            ghostPro = true,
+            buckets = listOf(
+                PieceBucket(0, 1, 2, 2, 1, 1, 1, 1),
+                PieceBucket(2, 3, 2, 1, 2, 0, 1, 0),
+            ),
+            playback = listOf(PlaybackPieceRange(0, 0, "U")),
+            playheads = listOf(0),
+            detail = PlaybackDetail(0, "vr", 0),
+        )
+        transport.enqueueRaw(EngineBytesResponse(200, encoded))
+        val t = client.pieces("abc", 256)
+        assertEquals("/pieces-bin/abc?maxBuckets=256", transport.takeRequest().path)
+        assertEquals("abc", t.id)
+        assertEquals("dead", t.infoHash)
+        assertEquals(3L, t.generation)
+        assertEquals(2, t.buckets.size)
+        assertEquals(listOf(PlaybackPieceRange(0, 0, "U")), t.playback)
+        assertEquals(listOf(0), t.playheads)
+        assertEquals(PlaybackDetail(0, "vr", 0), t.playbackDetail)
+        assertTrue(t.ghostProMode)
+    }
+
+    @Test
+    fun addBytesPostsRawTorrentBody() {
+        transport.enqueueRaw(EngineBytesResponse(200, """{"id":"abc","infoHash":"dead"}""".toByteArray(Charsets.UTF_8)))
+        val bytes = "d8:announce0:4:infod4:name1:aee".toByteArray(Charsets.UTF_8)
+        val added = client.addBytes(bytes, prepare = true)
+        assertEquals("abc", added.id)
+        assertEquals("dead", added.infoHash)
+        val request = transport.takeRequest()
+        assertEquals("/add-bytes?prepare=true", request.path)
+        assertEquals(String(bytes, Charsets.UTF_8), request.body.readUtf8())
+    }
+
+    @Test
+    fun normalizeHitsEngineHelper() {
+        transport.enqueue(TestResponse().setBody("""{"id":"magnet:?xt=urn:btih:deadbeef","infoHash":"deadbeef"}"""))
+        val normalized = client.normalize("magnet:?xt=urn:btih:DEADBEEF")
+        assertEquals("/normalize?id=magnet%3A%3Fxt%3Durn%3Abtih%3ADEADBEEF", transport.takeRequest().path)
+        assertEquals("magnet:?xt=urn:btih:deadbeef", normalized.id)
+        assertEquals("deadbeef", normalized.infoHash)
+    }
+
+    @Test
+    fun parsePiecesBinRoundTripMatchesEncoder() {
+        val encoded = encodePiecesBinForTest(
+            id = "x",
+            infoHash = null,
+            generation = 1,
+            timestamp = 2,
+            totalPieces = 0,
+            pieceLength = 0,
+            lastPieceLength = 0,
+            maxBuckets = 8,
+            ghostPro = false,
+            buckets = emptyList(),
+            playback = emptyList(),
+            playheads = emptyList(),
+            detail = null,
+        )
+        val parsed = EngineClient.parsePiecesBin(encoded)
+        assertEquals("x", parsed.id)
+        assertNull(parsed.infoHash)
+        assertEquals(1L, parsed.generation)
+        assertEquals(2L, parsed.timestamp)
+        assertEquals(8, parsed.maxBuckets)
+        assertTrue(parsed.buckets.isEmpty())
+        assertNull(parsed.playbackDetail)
+    }
+
+    @Test
+    fun piecesParsesAbsentSelectedCountsAsZero() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"id":"legacy","totalPieces":2,"pieceLength":1024,"lastPieceLength":1024,"maxBuckets":2,
+                    "buckets":[
+                      {"start":0,"end":0,"total":1,"selected":1,"verified":1,"receiving":0},
+                      {"start":1,"end":1,"total":1,"selected":0,"verified":1,"receiving":0}
+                    ]}"""
+            )
+        )
+        val t = client.pieces("legacy")
+        assertEquals(2, t.buckets.size)
+        assertEquals(0, t.buckets[0].selectedVerified)
+        assertEquals(0, t.buckets[0].selectedReceiving)
+        assertEquals(0, t.buckets[1].selectedVerified)
+        assertEquals(0, t.buckets[1].selectedReceiving)
+    }
+
+    @Test
+    fun bypassStatusReadsAndParsesFields() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"enabled":true,"active":true,"mode":"stream-adapt","coverage":["outgoing-tcp-peers","http-trackers"],"error":null}"""
+            )
+        )
+        val status = client.getBypass()
+        assertEquals("/bypass", transport.takeRequest().path)
+        assertTrue(status.enabled)
+        assertTrue(status.active)
+        assertEquals("stream-adapt", status.mode)
+        assertEquals(listOf("outgoing-tcp-peers", "http-trackers"), status.coverage)
+        assertNull(status.error)
+    }
+
+    @Test
+    fun setBypassPostsEnabledAndReturnsStatus() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"enabled":false,"active":false,"mode":"off","coverage":[],"error":null}"""
+            )
+        )
+        val status = client.setBypass(false)
+        val req = transport.takeRequest()
+        assertEquals("/bypass", req.path)
+        assertEquals("{\"enabled\":false}", req.body.readUtf8())
+        assertFalse(status.enabled)
+        assertFalse(status.active)
+        assertEquals("off", status.mode)
+    }
+
+    @Test
+    fun cacheEndpointsParseCategoriesAndMemory() {
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"categories":[{"id":"startup","bytes":1024,"reclaimableBytes":512},{"id":"peers","bytes":2048,"reclaimableBytes":2048}],"memoryBytes":4096}"""
+            )
+        )
+        val cache = client.getCache()
+        assertEquals("/cache", transport.takeRequest().path)
+        assertEquals(2, cache.categories.size)
+        assertEquals("startup", cache.categories[0].id)
+        assertEquals(1024L, cache.categories[0].bytes)
+        assertEquals(512L, cache.categories[0].reclaimableBytes)
+        assertEquals(4096L, cache.memoryBytes)
+
+        transport.enqueue(
+            TestResponse().setBody(
+                """{"categories":[{"id":"startup","bytes":0,"reclaimableBytes":0}],"memoryBytes":0}"""
+            )
+        )
+        val cleared = client.clearCache(listOf("startup", "resume"))
+        val req = transport.takeRequest()
+        assertEquals("/cache/clear", req.path)
+        assertEquals("{\"categories\":[\"startup\",\"resume\"]}", req.body.readUtf8())
+        assertEquals(1, cleared.categories.size)
+        assertEquals(0L, cleared.categories[0].bytes)
+    }
+
+    @Test
+    fun claudeSeekModePostsSettingAndSeekStatsParse() {
+        transport.enqueue(TestResponse().setBody("""{"claudeSeekMode":true}"""))
+        assertTrue(client.setClaudeSeekMode(true))
+        val req = transport.takeRequest()
+        assertEquals("/settings", req.path)
+        assertEquals("{\"claudeSeekMode\":true}", req.body.readUtf8())
+
+        transport.enqueue(
+            TestResponse().setBody("""{"seekStats":{"count":4,"lastMs":820,"medianMs":640,"stalls":1}}""")
+        )
+        assertEquals(SeekStats(count = 4, lastMs = 820, medianMs = 640, stalls = 1), client.seekStats())
+
+        transport.enqueue(TestResponse().setBody("""{"maxPeers":55}"""))
+        assertNull(client.seekStats())
+    }
+}
+
+private fun encodePiecesBinForTest(
+    id: String,
+    infoHash: String?,
+    generation: Long,
+    timestamp: Long,
+    totalPieces: Int,
+    pieceLength: Long,
+    lastPieceLength: Long,
+    maxBuckets: Int,
+    ghostPro: Boolean,
+    buckets: List<PieceBucket>,
+    playback: List<PlaybackPieceRange>,
+    playheads: List<Int>,
+    detail: PlaybackDetail?,
+): ByteArray {
+    val idBytes = id.toByteArray(Charsets.UTF_8)
+    val hashBytes = infoHash?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
+    val detailStates = detail?.states?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
+    val buffer = ByteBuffer.allocate(
+        72 + idBytes.size + hashBytes.size + buckets.size * 32 + playback.size * 12 + playheads.size * 4 + detailStates.size,
+    ).order(ByteOrder.LITTLE_ENDIAN)
+    buffer.put("WTPC".toByteArray(Charsets.US_ASCII))
+    buffer.putShort(1)
+    buffer.putShort(if (ghostPro) 1 else 0)
+    buffer.putLong(generation)
+    buffer.putLong(timestamp)
+    buffer.putInt(totalPieces)
+    buffer.putInt(maxBuckets)
+    buffer.putLong(pieceLength)
+    buffer.putLong(lastPieceLength)
+    buffer.putShort(idBytes.size.toShort())
+    buffer.putShort(hashBytes.size.toShort())
+    buffer.putShort(buckets.size.toShort())
+    buffer.putShort(playback.size.toShort())
+    buffer.putShort(playheads.size.toShort())
+    buffer.putShort(detailStates.size.toShort())
+    buffer.putInt(detail?.start ?: 0)
+    buffer.putInt(detail?.playhead ?: 0)
+    buffer.putInt(0)
+    buffer.put(idBytes)
+    buffer.put(hashBytes)
+    for (bucket in buckets) {
+        buffer.putInt(bucket.start)
+        buffer.putInt(bucket.end)
+        buffer.putInt(bucket.total)
+        buffer.putInt(bucket.selected)
+        buffer.putInt(bucket.verified)
+        buffer.putInt(bucket.receiving)
+        buffer.putInt(bucket.selectedVerified)
+        buffer.putInt(bucket.selectedReceiving)
+    }
+    for (range in playback) {
+        buffer.putInt(range.start)
+        buffer.putInt(range.end)
+        buffer.put(range.priority[0].code.toByte())
+        buffer.put(0)
+        buffer.put(0)
+        buffer.put(0)
+    }
+    for (head in playheads) buffer.putInt(head)
+    buffer.put(detailStates)
+    return buffer.array()
+}

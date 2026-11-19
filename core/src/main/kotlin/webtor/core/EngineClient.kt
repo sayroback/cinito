@@ -1,0 +1,860 @@
+package webtor.core
+
+import org.json.JSONArray
+import org.json.JSONObject
+
+data class EngineResponse(
+    val statusCode: Int,
+    val body: String,
+)
+
+data class EngineBytesResponse(
+    val statusCode: Int,
+    val body: ByteArray,
+)
+
+fun interface EngineTransport {
+    fun request(method: String, path: String, body: String?): EngineResponse
+
+    /** Raw body/response path used by `/add-bytes` and `/pieces-bin`. */
+    fun requestRaw(method: String, path: String, body: ByteArray?): EngineBytesResponse {
+        val response = request(method, path, body?.toString(Charsets.UTF_8))
+        return EngineBytesResponse(response.statusCode, response.body.toByteArray(Charsets.UTF_8))
+    }
+}
+
+data class EngineStats(
+    val downloadSpeed: Long,
+    val uploadSpeed: Long,
+    val progress: Double,
+    val ratio: Double,
+    val torrents: Int,
+    val ctlPort: Int,
+    val streamPort: Int,
+    val path: String,
+    val listenPort: Int = 0,
+    val holepunch: HolepunchStats = HolepunchStats(),
+)
+
+/**
+ * BEP 55 hole punching counters, monotonic. On [EngineStats] they are client-wide
+ * (every torrent); on [TorrentConnections] they cover that one torrent only.
+ */
+data class HolepunchStats(
+    val rendezvousSent: Long = 0L,
+    val connectReceived: Long = 0L,
+    val relayedForOthers: Long = 0L,
+    val errorsReceived: Long = 0L,
+    val punchDialsAttempted: Long = 0L,
+    val punchDialsSucceeded: Long = 0L,
+)
+
+data class TorrentFile(
+    val index: Int,
+    val name: String,
+    val path: String,
+    val length: Long,
+    val progress: Double,
+    val type: String,
+    /** Hashed complete bytes; used for Done / offline-safe play, not the live UI bar. */
+    val verifiedBytes: Long = 0L,
+)
+
+data class TrackerStatus(
+    val url: String,
+    val tier: Int = 0,
+    val status: String = "waiting",
+    val message: String? = null,
+    val original: Boolean = true,
+)
+
+data class TorrentStatus(
+    val id: String,
+    val infoHash: String?,
+    val name: String?,
+    val magnetURI: String?,
+    val ready: Boolean,
+    val done: Boolean,
+    val paused: Boolean,
+    val progress: Double,
+    val downloadSpeed: Long,
+    val uploadSpeed: Long,
+    val numPeers: Int,
+    val length: Long,
+    val downloaded: Long,
+    val uploaded: Long,
+    val files: List<TorrentFile>,
+    val trackers: List<TrackerStatus> = emptyList(),
+    val error: String? = null,
+    val timeRemaining: Long? = null,
+    val configured: Boolean = false,
+    val selected: List<Int> = emptyList(),
+    val checking: Boolean = false,
+    val checkedPieces: Int = 0,
+    val checkTotal: Int = 0,
+    val focusedFile: Int? = null,
+    val warning: String? = null,
+    val verifiedBytes: Long = 0L,
+    val seeding: Boolean = false,
+    val seedRatio: Double = 0.0,
+    /** Direct Play only: open player readers, peers released while idle, and the engine's drop signal. */
+    val playbackReaders: Int = 0,
+    val resting: Boolean = false,
+    val idleDropReady: Boolean = false,
+    /** Play next warm-up of the following episode, when one was named at play. */
+    val nextPreload: NextPreload? = null,
+    val connectedSeeders: Int? = null,
+    val swarmAvailability: Double? = null,
+)
+
+/** [active] once the current episode nears its end; [ready] when its head and tail are verified. */
+data class NextPreload(val fileIndex: Int, val active: Boolean, val ready: Boolean)
+
+data class LivePreviewState(val active: Boolean, val byteOffset: Long, val signature: String)
+
+data class PlayInfo(
+    val id: String,
+    val fileIndex: Int,
+    val name: String,
+    val length: Long,
+    val streamUrl: String,
+)
+
+data class AddResult(val id: String, val infoHash: String?)
+
+data class NormalizedTorrentId(val id: String, val infoHash: String?)
+
+data class PeerConnection(
+    val address: String,
+    val transport: String,
+    val client: String,
+    val downloaded: Long,
+    val uploaded: Long,
+    val country: String? = null,
+    /** How the engine found the peer, as a PeerSource code ("C" = BEP 55 hole punch). */
+    val source: String? = null,
+    /** `"v1"` or `"v2"`: which BitTorrent swarm this connection is on. */
+    val bittorrentVersion: String? = null,
+) {
+    val holePunched: Boolean get() = source == PEER_SOURCE_HOLEPUNCH
+    val isBt2: Boolean get() = bittorrentVersion == "v2"
+}
+
+const val PEER_SOURCE_HOLEPUNCH = "C"
+
+data class TorrentConnections(
+    val id: String,
+    val paused: Boolean,
+    val peers: List<PeerConnection>,
+    /**
+     * This torrent's BEP 55 counters from `GET /connections/{id}`. Null when the
+     * engine does not report them per torrent (older engines): callers must then
+     * show nothing rather than the client-wide `/stats` counters.
+     */
+    val holepunch: HolepunchStats? = null,
+)
+
+data class PieceBucket(
+    val start: Int,
+    val end: Int,
+    val total: Int,
+    val selected: Int,
+    val verified: Int,
+    val receiving: Int,
+    val selectedVerified: Int = 0,
+    val selectedReceiving: Int = 0,
+)
+
+/** Inclusive piece range of one playback tier: U urgent, N fast, R readahead, L lookahead, B rewind. */
+data class PlaybackPieceRange(val start: Int, val end: Int, val priority: String)
+
+/**
+ * The playing reader's window, one state per piece from [start]: v verified,
+ * s saved on storage only, r receiving, m missing.
+ */
+data class PlaybackDetail(val start: Int, val states: String, val playhead: Int)
+
+/** Seek-to-first-byte times recorded by the engine since Claude optimized seek last changed. */
+data class SeekStats(
+    val count: Int,
+    val lastMs: Long,
+    val medianMs: Long,
+    val stalls: Int,
+)
+
+data class PieceTelemetry(
+    val id: String,
+    val infoHash: String?,
+    val generation: Long,
+    val timestamp: Long,
+    val totalPieces: Int,
+    val pieceLength: Long,
+    val lastPieceLength: Long,
+    val maxBuckets: Int,
+    val buckets: List<PieceBucket>,
+    val ghostProMode: Boolean = false,
+    val playback: List<PlaybackPieceRange> = emptyList(),
+    val playheads: List<Int> = emptyList(),
+    val playbackDetail: PlaybackDetail? = null,
+)
+
+data class BypassStatus(
+    val enabled: Boolean,
+    val active: Boolean,
+    val mode: String,
+    val coverage: List<String>,
+    val error: String? = null,
+)
+
+data class CacheCategory(
+    val id: String,
+    val bytes: Long,
+    val reclaimableBytes: Long,
+)
+
+data class CacheSummary(
+    val categories: List<CacheCategory>,
+    val memoryBytes: Long,
+)
+
+class EngineException(
+    message: String,
+    val statusCode: Int = 0,
+) : RuntimeException(message)
+
+class EngineClient(
+    private val transport: EngineTransport,
+) {
+    fun stats(): EngineStats {
+        val json = get("/stats")
+        return EngineStats(
+            downloadSpeed = json.optLong("downloadSpeed"),
+            uploadSpeed = json.optLong("uploadSpeed"),
+            progress = json.optDouble("progress"),
+            ratio = json.optDouble("ratio"),
+            torrents = json.optInt("torrents"),
+            ctlPort = json.optInt("ctlPort"),
+            streamPort = json.optInt("streamPort"),
+            path = json.optString("path"),
+            listenPort = json.optInt("listenPort"),
+            holepunch = parseHolepunchStats(json.optJSONObject("holepunch")),
+        )
+    }
+
+    fun add(torrentId: String, prepare: Boolean = false, torrentData: String? = null): AddResult {
+        val json = post("/add", JSONObject().put("torrentId", torrentId).put("prepare", prepare).apply {
+            if (torrentData != null) put("torrentData", torrentData)
+        })
+        return AddResult(json.getString("id"), json.nullableString("infoHash"))
+    }
+
+    /** Adds a `.torrent` file without Base64-wrapping it in JSON. */
+    fun addBytes(torrentBytes: ByteArray, prepare: Boolean = false): AddResult {
+        val path = if (prepare) "/add-bytes?prepare=true" else "/add-bytes"
+        val response = transport.requestRaw("POST", path, torrentBytes)
+        val json = runCatching { JSONObject(String(response.body, Charsets.UTF_8)) }.getOrNull()
+        if (response.statusCode !in 200..299) {
+            val err = json?.optString("error").orEmpty().ifEmpty { String(response.body, Charsets.UTF_8) }
+            throw EngineException("Engine ${response.statusCode}: $err", statusCode = response.statusCode)
+        }
+        val body = json ?: throw EngineException("The download engine returned an invalid response.")
+        return AddResult(body.getString("id"), body.nullableString("infoHash"))
+    }
+
+    /**
+     * Canonical magnet / info-hash form used for library keys.
+     * Base32 magnets become hex; bare hashes become lowercase hex.
+     */
+    fun normalize(id: String): NormalizedTorrentId {
+        val encoded = java.net.URLEncoder.encode(id, Charsets.UTF_8.name())
+        val json = get("/normalize?id=$encoded")
+        return NormalizedTorrentId(json.getString("id"), json.nullableString("infoHash"))
+    }
+
+    fun torrent(id: String): TorrentStatus {
+        val json = get("/torrent/$id")
+        return parseTorrent(json)
+    }
+
+    fun play(
+        id: String, fileIndex: Int? = null, offset: Long? = null, boost: Boolean = false, fileOnly: Boolean = false,
+        adaptiveBuffer: Boolean = false, burstAwareBuffer: Boolean = false, nextFileIndex: Int? = null,
+    ): PlayInfo {
+        val body = JSONObject().put("id", id)
+        if (fileIndex != null) body.put("fileIndex", fileIndex)
+        if (nextFileIndex != null) body.put("nextFileIndex", nextFileIndex)
+        if (offset != null) body.put("offset", offset.coerceAtLeast(0L))
+        if (boost) body.put("boost", true)
+        if (fileOnly) body.put("fileOnly", true)
+        if (adaptiveBuffer) body.put("adaptiveBuffer", true)
+        if (burstAwareBuffer) body.put("burstAwareBuffer", true)
+        return parsePlay(post("/play", body))
+    }
+
+    /** Restores the other selected files after a file-only playback ends. */
+    fun clearFileOnly(id: String) {
+        post("/file-only", JSONObject().put("id", id).put("enabled", false))
+    }
+
+    fun remove(id: String, destroyStore: Boolean = true) {
+        try {
+            post("/remove", JSONObject().put("id", id).put("destroyStore", destroyStore))
+        } catch (e: EngineException) {
+            if (e.statusCode != 404) throw e
+        }
+    }
+
+    /** Drops saved peer addresses for a torrent that may already have been dropped. */
+    fun forgetPeerHints(infoHash: String) {
+        post("/forget-peers", JSONObject().put("infoHash", infoHash))
+    }
+
+    fun pieces(id: String, maxBuckets: Int? = null): PieceTelemetry {
+        val query = if (maxBuckets != null) "?maxBuckets=$maxBuckets" else ""
+        val binary = runCatching {
+            val response = transport.requestRaw("GET", "/pieces-bin/$id$query", null)
+            if (response.statusCode !in 200..299) {
+                throw EngineException("Engine ${response.statusCode}", statusCode = response.statusCode)
+            }
+            parsePiecesBin(response.body)
+        }
+        if (binary.isSuccess) return binary.getOrThrow()
+        val json = get("/pieces/$id$query")
+        return parsePieces(json)
+    }
+
+    fun previewState(id: String, fileIndex: Int): LivePreviewState {
+        val json = get("/preview-state/$id?fileIndex=$fileIndex")
+        return LivePreviewState(json.optBoolean("active"), json.optLong("byteOffset").coerceAtLeast(0L), json.optString("signature"))
+    }
+
+    fun metadata(id: String): String = get("/metadata/$id").getString("torrentData")
+
+    fun connections(id: String): TorrentConnections = parseConnections(get("/connections/$id"))
+
+    fun configure(
+        id: String,
+        descriptors: List<Int?>,
+        selected: Set<Int>,
+        storageMode: String = "download",
+        streamCacheBytes: Long = 0L,
+    ) {
+        post("/configure", JSONObject().put("id", id)
+            .put("descriptors", JSONArray().apply { descriptors.forEach { put(it ?: JSONObject.NULL) } })
+            .put("selected", JSONArray(selected.toList()))
+            .put("storageMode", storageMode).put("streamCacheBytes", streamCacheBytes))
+    }
+
+    fun select(id: String, selected: Set<Int>, descriptors: List<Int?>? = null) {
+        post("/select", JSONObject().put("id", id).put("selected", JSONArray(selected.toList())).apply {
+            if (descriptors != null) {
+                put("descriptors", JSONArray().apply {
+                    descriptors.forEach { put(it ?: JSONObject.NULL) }
+                })
+            }
+        })
+    }
+
+    fun pause(id: String) { post("/pause", JSONObject().put("id", id)) }
+    fun resume(id: String) { post("/resume", JSONObject().put("id", id)) }
+    fun networkChanged(generation: Long, connected: Boolean) {
+        post("/network", JSONObject().put("generation", generation).put("connected", connected))
+    }
+    fun focus(id: String, fileIndex: Int?) { post("/focus", JSONObject().put("id", id).apply { if (fileIndex == null) put("fileIndex", JSONObject.NULL) else put("fileIndex", fileIndex) }) }
+
+    fun maxPeers(): Int = get("/settings").optInt("maxPeers", 40)
+
+    fun setSeeding(enabled: Boolean, allowed: Boolean, ratioMilli: Int, minutes: Int, uploadKiB: Int) {
+        post("/settings", JSONObject().put("seedingEnabled", enabled).put("seedingAllowed", allowed)
+            .put("seedRatioMilli", ratioMilli).put("seedTimeMinutes", minutes)
+            .put("uploadRateBytesSec", if (enabled) uploadKiB.toLong() * 1024L else 0L))
+    }
+
+    fun setMaxPeers(maxPeers: Int): Int =
+        post("/settings", JSONObject().put("maxPeers", maxPeers)).optInt("maxPeers", maxPeers)
+
+    fun setRamCacheMiB(sizeMiB: Int): Int {
+        val bytes = sizeMiB.toLong() * 1024L * 1024L
+        return (post("/settings", JSONObject().put("ramCacheBytes", bytes))
+            .getLong("ramCacheBytes") / (1024L * 1024L)).toInt()
+    }
+
+    fun transferRates(): Pair<Long, Long> {
+        val j = get("/settings")
+        return j.optLong("downloadRateBytesSec", 0L) to j.optLong("uploadRateBytesSec", 0L)
+    }
+
+    fun setTransferRates(downloadRateBytesSec: Long, uploadRateBytesSec: Long): Pair<Long, Long> {
+        val j = post("/settings", JSONObject().put("downloadRateBytesSec", downloadRateBytesSec.coerceAtLeast(0L)).put("uploadRateBytesSec", uploadRateBytesSec.coerceAtLeast(0L)))
+        return j.optLong("downloadRateBytesSec", downloadRateBytesSec) to j.optLong("uploadRateBytesSec", uploadRateBytesSec)
+    }
+
+    /** Caps download only. Omitting uploadRateBytesSec leaves the upload limiter unchanged. */
+    fun setDownloadRateBytesSec(bytesPerSecond: Long): Long {
+        val rate = bytesPerSecond.coerceAtLeast(0L)
+        return post("/settings", JSONObject().put("downloadRateBytesSec", rate)).optLong("downloadRateBytesSec", rate)
+    }
+
+    /** Caps peer dials per second. The body is only dialRatePerSec, so transfer limiters stay unchanged. */
+    fun setDialRatePerSec(perSec: Int): Int {
+        val rate = perSec.coerceIn(10, 80)
+        return post("/settings", JSONObject().put("dialRatePerSec", rate)).optInt("dialRatePerSec", rate)
+    }
+
+    fun setPeerExploration(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("peerExploration", enabled)).optBoolean("peerExploration", enabled)
+
+    fun setGhostMode(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("ghostMode", enabled)).optBoolean("ghostMode", enabled)
+
+    fun setGhostProMode(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("ghostProMode", enabled)).optBoolean("ghostProMode", enabled)
+
+    /** Minutes an unattended Direct Play session may stay idle before Android drops it; 0 turns this off. */
+    /**
+     * One CSV line per HTTP playback request goes to [path]; [tag] marks the build. With
+     * [experiment] each range request runs with seek rules picked at random, named in the log.
+     */
+    fun setSeekLog(path: String, tag: String, experiment: Boolean = false) {
+        post("/settings", JSONObject().put("seekLogPath", path).put("seekLogTag", tag).put("seekExperiment", experiment))
+    }
+
+    fun setIdleDropMinutes(minutes: Int): Int {
+        val value = minutes.coerceIn(0, 240)
+        return post("/settings", JSONObject().put("idleDropMinutes", value)).optInt("idleDropMinutes", value)
+    }
+
+    fun setClaudeSeekMode(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("claudeSeekMode", enabled)).optBoolean("claudeSeekMode", enabled)
+
+    /** Experimental: ask a second peer for a block stuck at the playhead. */
+    fun setHedgeRequests(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("hedgeRequests", enabled)).optBoolean("hedgeRequests", enabled)
+
+    /** Experimental: slow peers leave playback pieces to faster peers. */
+    fun setSlowPeerYield(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("slowPeerYield", enabled)).optBoolean("slowPeerYield", enabled)
+
+    /** Experimental: drop peers that keep us choked for 5 s when others wait. */
+    fun setDropChokers(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("dropChokers", enabled)).optBoolean("dropChokers", enabled)
+
+    /** Seek method: blocks at a new position go to peers in the order they can deliver them. */
+    fun setDeadlineSeek(enabled: Boolean): Boolean =
+        post("/settings", JSONObject().put("deadlineSeek", enabled)).optBoolean("deadlineSeek", enabled)
+
+    /** Null when the engine predates seek statistics. */
+    fun seekStats(): SeekStats? {
+        val settings = get("/settings")
+        return settings.optJSONObject("seekStats")?.let(::parseSeekStats)
+    }
+
+    /**
+     * Gates torrent payload bytes globally while preserving tracker, DHT and
+     * magnet metadata discovery. Older engines simply reject the optional
+     * setting; callers treat that as an unavailable engine capability.
+     */
+    fun setPayloadTransfersAllowed(allowed: Boolean): Boolean =
+        post("/settings", JSONObject().put("payloadTransfersAllowed", allowed))
+            .optBoolean("payloadTransfersAllowed", allowed)
+
+    fun getBypass(): BypassStatus {
+        val json = get("/bypass")
+        val coverageArr = json.optJSONArray("coverage") ?: JSONArray()
+        val coverage = List(coverageArr.length()) { coverageArr.getString(it) }
+        return BypassStatus(
+            enabled = json.optBoolean("enabled"),
+            active = json.optBoolean("active"),
+            mode = json.optString("mode", "off"),
+            coverage = coverage,
+            error = json.nullableString("error"),
+        )
+    }
+
+    fun setBypass(enabled: Boolean): BypassStatus {
+        val json = post("/bypass", JSONObject().put("enabled", enabled))
+        val coverageArr = json.optJSONArray("coverage") ?: JSONArray()
+        val coverage = List(coverageArr.length()) { coverageArr.getString(it) }
+        return BypassStatus(
+            enabled = json.optBoolean("enabled", enabled),
+            active = json.optBoolean("active"),
+            mode = json.optString("mode", if (enabled) "active" else "off"),
+            coverage = coverage,
+            error = json.nullableString("error"),
+        )
+    }
+
+    fun getCache(): CacheSummary {
+        val json = get("/cache")
+        return parseCacheSummary(json)
+    }
+
+    fun clearCache(categories: List<String>): CacheSummary {
+        val json = post("/cache/clear", JSONObject().put("categories", JSONArray(categories)))
+        return parseCacheSummary(json)
+    }
+
+    fun shutdown() {
+        post("/shutdown", JSONObject())
+    }
+
+    /** Recent engine events and totals, as JSON text for diagnostics. */
+    fun events(): String = get("/events").toString()
+
+    private fun get(path: String): JSONObject = execute("GET", path, null)
+
+    private fun post(path: String, body: JSONObject): JSONObject = execute("POST", path, body.toString())
+
+    private fun execute(method: String, path: String, body: String?): JSONObject {
+        val response = transport.request(method, path, body)
+        val json = runCatching { JSONObject(response.body) }.getOrNull()
+        if (response.statusCode !in 200..299) {
+            val err = json?.optString("error").orEmpty().ifEmpty { response.body }
+            throw EngineException("Engine ${response.statusCode}: $err", statusCode = response.statusCode)
+        }
+        return json ?: throw EngineException("The download engine returned an invalid response.")
+    }
+
+    companion object {
+        private fun parsePlay(json: JSONObject) = PlayInfo(
+            id = json.getString("id"),
+            fileIndex = json.optInt("fileIndex"),
+            name = json.optString("name"),
+            length = json.optLong("length"),
+            streamUrl = json.getString("streamUrl"),
+        )
+
+        /** A missing object (older engines) reads as all zeros. */
+        fun parseHolepunchStats(json: JSONObject?): HolepunchStats {
+            if (json == null) return HolepunchStats()
+            fun count(key: String) = json.optLong(key).coerceAtLeast(0L)
+            return HolepunchStats(
+                rendezvousSent = count("rendezvousSent"),
+                connectReceived = count("connectReceived"),
+                relayedForOthers = count("relayedForOthers"),
+                errorsReceived = count("errorsReceived"),
+                punchDialsAttempted = count("punchDialsAttempted"),
+                punchDialsSucceeded = count("punchDialsSucceeded"),
+            )
+        }
+
+        fun parseConnections(json: JSONObject): TorrentConnections {
+            val peers = json.optJSONArray("peers") ?: JSONArray()
+            return TorrentConnections(
+                id = json.getString("id"),
+                paused = json.optBoolean("paused"),
+                peers = List(peers.length()) { index ->
+                    val peer = peers.getJSONObject(index)
+                    PeerConnection(
+                        address = peer.getString("address"),
+                        transport = peer.optString("transport", "Unknown"),
+                        client = peer.optString("client"),
+                        downloaded = peer.optLong("downloaded"),
+                        uploaded = peer.optLong("uploaded"),
+                        country = peer.nullableString("country"),
+                        source = peer.nullableString("source"),
+                        bittorrentVersion = peer.nullableString("bittorrentVersion"),
+                    )
+                },
+                holepunch = json.optJSONObject("holepunch")?.let { parseHolepunchStats(it) },
+            )
+        }
+
+        fun parseSeekStats(json: JSONObject): SeekStats = SeekStats(
+            count = json.optInt("count").coerceAtLeast(0),
+            lastMs = json.optLong("lastMs").coerceAtLeast(0L),
+            medianMs = json.optLong("medianMs").coerceAtLeast(0L),
+            stalls = json.optInt("stalls").coerceAtLeast(0),
+        )
+
+        fun parsePiecesBin(bytes: ByteArray): PieceTelemetry {
+            require(bytes.size >= 72) { "truncated pieces-bin payload" }
+            require(bytes[0] == 'W'.code.toByte() && bytes[1] == 'T'.code.toByte() &&
+                bytes[2] == 'P'.code.toByte() && bytes[3] == 'C'.code.toByte()) {
+                "bad pieces-bin magic"
+            }
+            fun u16(offset: Int): Int =
+                (bytes[offset].toInt() and 0xff) or ((bytes[offset + 1].toInt() and 0xff) shl 8)
+            fun u32(offset: Int): Int {
+                val b0 = bytes[offset].toInt() and 0xff
+                val b1 = bytes[offset + 1].toInt() and 0xff
+                val b2 = bytes[offset + 2].toInt() and 0xff
+                val b3 = bytes[offset + 3].toInt() and 0xff
+                return b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)
+            }
+            fun i64(offset: Int): Long {
+                var value = 0L
+                for (i in 0 until 8) {
+                    value = value or ((bytes[offset + i].toLong() and 0xffL) shl (8 * i))
+                }
+                return value
+            }
+            val version = u16(4)
+            require(version == 1) { "unsupported pieces-bin version $version" }
+            val flags = u16(6)
+            val generation = i64(8)
+            val timestamp = i64(16)
+            val totalPieces = u32(24)
+            val maxBuckets = u32(28)
+            val pieceLength = i64(32)
+            val lastPieceLength = i64(40)
+            val idLen = u16(48)
+            val infoHashLen = u16(50)
+            val bucketCount = u16(52)
+            val playbackCount = u16(54)
+            val playheadCount = u16(56)
+            val detailStatesLen = u16(58)
+            val detailStart = u32(60)
+            val detailPlayhead = u32(64)
+            var offset = 72
+            fun take(len: Int): ByteArray {
+                require(offset + len <= bytes.size) { "truncated pieces-bin payload" }
+                val slice = bytes.copyOfRange(offset, offset + len)
+                offset += len
+                return slice
+            }
+            val id = String(take(idLen), Charsets.UTF_8)
+            val infoHash = if (infoHashLen == 0) null else String(take(infoHashLen), Charsets.UTF_8)
+            val buckets = ArrayList<PieceBucket>(bucketCount)
+            repeat(bucketCount) {
+                val start = u32(offset)
+                val end = u32(offset + 4)
+                val total = u32(offset + 8)
+                val selected = u32(offset + 12)
+                val verified = u32(offset + 16)
+                val receiving = u32(offset + 20)
+                val selectedVerified = u32(offset + 24)
+                val selectedReceiving = u32(offset + 28)
+                offset += 32
+                buckets.add(
+                    PieceBucket(
+                        start = start,
+                        end = end,
+                        total = total,
+                        selected = selected,
+                        verified = verified,
+                        receiving = receiving,
+                        selectedVerified = selectedVerified,
+                        selectedReceiving = selectedReceiving,
+                    ),
+                )
+            }
+            val playback = ArrayList<PlaybackPieceRange>(playbackCount)
+            repeat(playbackCount) {
+                val start = u32(offset)
+                val end = u32(offset + 4)
+                val priority = when (bytes[offset + 8].toInt().toChar()) {
+                    'U' -> "U"
+                    'N' -> "N"
+                    'R' -> "R"
+                    'L' -> "L"
+                    'B' -> "B"
+                    else -> error("invalid playback priority")
+                }
+                offset += 12
+                playback.add(PlaybackPieceRange(start, end, priority))
+            }
+            val playheads = ArrayList<Int>(playheadCount)
+            repeat(playheadCount) {
+                playheads.add(u32(offset))
+                offset += 4
+            }
+            val detail = if (detailStatesLen == 0) {
+                null
+            } else {
+                val states = String(take(detailStatesLen), Charsets.UTF_8)
+                PlaybackDetail(detailStart, states, detailPlayhead)
+            }
+            require(offset == bytes.size) { "pieces-bin length mismatch" }
+            return PieceTelemetry(
+                id = id,
+                infoHash = infoHash,
+                generation = generation,
+                timestamp = timestamp,
+                totalPieces = totalPieces,
+                pieceLength = pieceLength,
+                lastPieceLength = lastPieceLength,
+                maxBuckets = maxBuckets,
+                buckets = buckets,
+                ghostProMode = flags and 1 != 0,
+                playback = playback,
+                playheads = playheads,
+                playbackDetail = detail,
+            )
+        }
+
+        fun parsePieces(json: JSONObject): PieceTelemetry {
+            val buckets = ArrayList<PieceBucket>()
+            val arr: JSONArray = json.optJSONArray("buckets") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val b = arr.getJSONObject(i)
+                val start = b.optInt("start")
+                val end = b.optInt("end", start)
+                buckets.add(
+                    PieceBucket(
+                        start = start,
+                        end = end,
+                        total = b.optInt("total", end - start + 1),
+                        selected = b.optInt("selected"),
+                        verified = b.optInt("verified"),
+                        receiving = b.optInt("receiving"),
+                        selectedVerified = b.optInt("selectedVerified"),
+                        selectedReceiving = b.optInt("selectedReceiving"),
+                    )
+                )
+            }
+            val playback = json.optJSONArray("playback") ?: JSONArray()
+            val ranges = List(playback.length()) { index ->
+                val range = playback.getJSONObject(index)
+                PlaybackPieceRange(range.optInt("start", -1), range.optInt("end", -1), range.optString("priority"))
+            }.filter { it.start >= 0 && it.end >= it.start && it.priority in setOf("U", "N", "R", "L", "B") }
+            val heads = json.optJSONArray("playheads") ?: JSONArray()
+            val playheads = List(heads.length()) { heads.optInt(it, -1) }.filter { it >= 0 }
+            val detail = json.optJSONObject("playbackDetail")?.let { d ->
+                val states = d.optString("states")
+                val start = d.optInt("start", -1)
+                if (start < 0 || states.isEmpty() || states.any { it !in "vsrm" }) null
+                else PlaybackDetail(start, states, d.optInt("playhead", start))
+            }
+            return PieceTelemetry(
+                id = json.getString("id"),
+                infoHash = json.nullableString("infoHash"),
+                generation = json.optLong("generation", 1L),
+                timestamp = json.optLong("timestamp"),
+                totalPieces = json.optInt("totalPieces"),
+                pieceLength = json.optLong("pieceLength"),
+                lastPieceLength = json.optLong("lastPieceLength"),
+                maxBuckets = json.optInt("maxBuckets", buckets.size),
+                buckets = buckets,
+                ghostProMode = json.optBoolean("ghostProMode"),
+                playback = ranges,
+                playheads = playheads,
+                playbackDetail = detail,
+            )
+        }
+
+        fun parseTorrent(json: JSONObject): TorrentStatus {
+            val files = ArrayList<TorrentFile>()
+            val arr: JSONArray = json.optJSONArray("files") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val f = arr.getJSONObject(i)
+                files.add(
+                    TorrentFile(
+                        index = f.optInt("index", i),
+                        name = f.optString("name"),
+                        path = f.optString("path"),
+                        length = f.optLong("length"),
+                        progress = f.progress(),
+                        type = f.optString("type"),
+                        verifiedBytes = f.optLong("verifiedBytes", 0L),
+                    )
+                )
+            }
+            val selected = ArrayList<Int>()
+            val selectedArr: JSONArray? = json.optJSONArray("selected")
+            if (selectedArr != null) {
+                for (i in 0 until selectedArr.length()) {
+                    selected.add(selectedArr.optInt(i))
+                }
+            }
+            val trackers = ArrayList<TrackerStatus>()
+            val trackersArr: JSONArray = json.optJSONArray("trackers") ?: JSONArray()
+            for (i in 0 until trackersArr.length()) {
+                val tr = trackersArr.optJSONObject(i) ?: continue
+                val url = tr.optString("url")
+                if (url.isBlank()) continue
+                trackers.add(
+                    TrackerStatus(
+                        url = url,
+                        tier = tr.optInt("tier"),
+                        status = tr.optString("status", "waiting").ifBlank { "waiting" },
+                        message = tr.nullableString("message"),
+                        original = tr.optBoolean("original", true),
+                    )
+                )
+            }
+            return TorrentStatus(
+                id = json.getString("id"),
+                infoHash = json.nullableString("infoHash"),
+                name = json.nullableString("name"),
+                magnetURI = json.nullableString("magnetURI"),
+                ready = json.optBoolean("ready"),
+                done = json.optBoolean("done"),
+                paused = json.optBoolean("paused"),
+                progress = json.progress(),
+                downloadSpeed = json.optLong("downloadSpeed"),
+                uploadSpeed = json.optLong("uploadSpeed"),
+                numPeers = json.optInt("numPeers"),
+                connectedSeeders = json.finiteInt("connectedSeeders"),
+                swarmAvailability = json.finiteDouble("swarmAvailability"),
+                length = json.optLong("length"),
+                downloaded = json.optLong("downloaded"),
+                uploaded = json.optLong("uploaded"),
+                seeding = json.optBoolean("seeding"),
+                seedRatio = json.optDouble("seedRatio", 0.0),
+                playbackReaders = json.optInt("playbackReaders").coerceAtLeast(0),
+                resting = json.optBoolean("resting"),
+                idleDropReady = json.optBoolean("idleDropReady"),
+                nextPreload = json.optJSONObject("nextPreload")?.let {
+                    NextPreload(it.optInt("fileIndex", -1), it.optBoolean("active"), it.optBoolean("ready"))
+                }?.takeIf { it.fileIndex >= 0 },
+                files = files,
+                trackers = trackers,
+                error = if (json.isNull("error")) null else json.optString("error").ifEmpty { null },
+                timeRemaining = json.finiteLong("timeRemaining"),
+                configured = json.optBoolean("configured"),
+                selected = selected,
+                checking = json.optBoolean("checking"),
+                checkedPieces = json.optInt("checkedPieces"),
+                checkTotal = json.optInt("checkTotal"),
+                focusedFile = if (json.has("focusedFile") && !json.isNull("focusedFile")) json.optInt("focusedFile") else null,
+                warning = json.nullableString("warning"),
+                verifiedBytes = json.optLong("verifiedBytes", 0L),
+            )
+        }
+
+        fun parseCacheSummary(json: JSONObject): CacheSummary {
+            val categories = ArrayList<CacheCategory>()
+            val arr = json.optJSONArray("categories") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val cat = arr.getJSONObject(i)
+                categories.add(
+                    CacheCategory(
+                        id = cat.getString("id"),
+                        bytes = cat.optLong("bytes", 0L),
+                        reclaimableBytes = cat.optLong("reclaimableBytes", 0L),
+                    )
+                )
+            }
+            return CacheSummary(
+                categories = categories,
+                memoryBytes = json.optLong("memoryBytes", 0L),
+            )
+        }
+    }
+}
+
+private fun JSONObject.nullableString(key: String): String? = if (isNull(key)) null else optString(key).ifEmpty { null }
+
+private fun JSONObject.progress(): Double = optDouble("progress", 0.0)
+    .let { if (it.isFinite()) it.coerceIn(0.0, 1.0) else 0.0 }
+
+private fun JSONObject.finiteLong(key: String): Long? {
+    if (!has(key) || isNull(key)) return null
+    val d = optDouble(key)
+    if (!d.isFinite()) return null
+    return optLong(key)
+}
+
+private fun JSONObject.finiteInt(key: String): Int? {
+    if (!has(key) || isNull(key)) return null
+    val d = optDouble(key)
+    if (!d.isFinite()) return null
+    return optInt(key).takeIf { it >= 0 }
+}
+
+private fun JSONObject.finiteDouble(key: String): Double? {
+    if (!has(key) || isNull(key)) return null
+    val d = optDouble(key)
+    return if (d.isFinite() && d >= 0.0) d else null
+}

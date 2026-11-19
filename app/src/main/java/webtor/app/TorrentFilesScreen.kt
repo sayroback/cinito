@@ -1,0 +1,899 @@
+package webtor.app
+
+import android.os.SystemClock
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Audiotrack
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.cinito.online.metadata.AudioTrackProbeRepository
+import org.cinito.online.metadata.ContainerProbeResult
+import org.cinito.online.ui.library.InlineTrackBreakdownPanel
+import org.cinito.online.ui.library.VerifiedAudioSummaryPill
+import org.cinito.online.ui.library.isInspectableContainerName
+import webtor.core.PieceTelemetry
+
+enum class DetailFileFilter { ALL, VIDEOS, SUBTITLES }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TorrentFilesScreen(
+    entry: DownloadEntry,
+    error: String?,
+    onBack: () -> Unit,
+    onPlay: (Int) -> Unit,
+    onToggleFile: (Int) -> Unit,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onDrop: () -> Unit = {},
+    onDelete: () -> Unit,
+) {
+    BackHandler(onBack = onBack)
+    val colors = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+    val app = context.applicationContext as WebtorApp
+    val client = app.engineClient
+    val probeRepo = app.audioProbeRepository
+    val probesMap by probeRepo.probes.collectAsState()
+    val probingKeys by probeRepo.probingKeys.collectAsState()
+    val probeScope = rememberCoroutineScope()
+    val entryInfoHash = remember(entry) { AudioTrackProbeRepository.extractEntryInfoHash(entry) }
+    val ghostProMode = app.session.ui.collectAsState().value.ghostProMode
+    var telemetry by remember(entry.key) { mutableStateOf<PieceTelemetry?>(null) }
+    var copiedMagnet by remember(entry.key) { mutableStateOf(false) }
+    val magnetUri = resolveMagnetUri(entry)
+    LaunchedEffect(copiedMagnet) {
+        if (copiedMagnet) {
+            delay(2_000)
+            copiedMagnet = false
+        }
+    }
+    val latestEntry by rememberUpdatedState(entry)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(entry.key, entry.engineId, lifecycleOwner, ghostProMode) {
+        val engineId = entry.engineId
+        // Engine id changes (or going offline) must not keep a stale map.
+        telemetry = null
+        if (engineId == null) return@LaunchedEffect
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var eventVersion = -1L
+            var lastFetchElapsed = 0L
+            // First map loads promptly; later reads stay ≤ 1 Hz.
+            val first = withContext(Dispatchers.IO) {
+                runCatching { client.pieces(engineId, 256) }.getOrNull()
+            }
+            if (first != null) telemetry = first
+            lastFetchElapsed = SystemClock.elapsedRealtime()
+            if (latestEntry.complete && !ghostProMode) return@repeatOnLifecycle
+            while (true) {
+                val nextVersion = withContext(Dispatchers.IO) {
+                    // Verified-file seeks can move windows without changing any
+                    // transfer counters. Refresh Ghost Pro's visible map at 1 Hz.
+                    app.engine.awaitChange(eventVersion, if (ghostProMode) 1_000 else 30_000)
+                }
+                if (nextVersion == eventVersion && !ghostProMode) continue
+                eventVersion = nextVersion
+                val elapsed = SystemClock.elapsedRealtime() - lastFetchElapsed
+                if (elapsed < 1_000L) delay(1_000L - elapsed)
+                val next = withContext(Dispatchers.IO) {
+                    runCatching { client.pieces(engineId, 256) }.getOrNull()
+                }
+                if (next != null) telemetry = next
+                lastFetchElapsed = SystemClock.elapsedRealtime()
+                if (latestEntry.complete && !ghostProMode) break
+            }
+        }
+    }
+    val files = entry.files
+    val status = entry.status
+    val busy = entry.controlsBusy()
+
+    LaunchedEffect(entry.key, entry.engineId, files.size) {
+        probeRepo.probeLibraryEntries(listOf(entry), maxNewProbes = 12)
+    }
+
+    var fileQuery by rememberSaveable(entry.key) { mutableStateOf("") }
+    var naturalOrder by rememberSaveable(entry.key) { mutableStateOf(true) }
+    var fileFilter by rememberSaveable(entry.key) { mutableStateOf(DetailFileFilter.ALL) }
+
+    var subtitleMap by remember(entry.key) { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
+    LaunchedEffect(entry.files) {
+        subtitleMap = withContext(Dispatchers.Default) {
+            val videos = entry.files.filter { it.name.isVideoName() || it.path.isVideoName() }
+            val videoStems = videos.map { it.path.substringBeforeLast('.').lowercase(Locale.ROOT) }
+            val subs = entry.files.filter { it.name.isSubtitleName() || it.path.isSubtitleName() }
+            videoStems.associateWith { stem ->
+                subs.filter { sub ->
+                    val p = sub.path.lowercase(Locale.ROOT)
+                    p == stem || p.startsWith("$stem.") || p.startsWith("$stem/")
+                }.map { it.name }
+            }
+        }
+    }
+
+    val displayedFiles by produceState(entry.files, entry.files, fileQuery, naturalOrder, fileFilter) {
+        value = withContext(Dispatchers.Default) {
+            var list = entry.files
+            when (fileFilter) {
+                DetailFileFilter.VIDEOS -> list = list.filter { it.name.isVideoName() || it.path.isVideoName() }
+                DetailFileFilter.SUBTITLES -> list = list.filter { it.name.isSubtitleName() || it.path.isSubtitleName() }
+                DetailFileFilter.ALL -> Unit
+            }
+            if (fileQuery.isNotBlank()) {
+                val q = fileQuery.trim()
+                list = list.filter { it.name.contains(q, ignoreCase = true) || it.path.contains(q, ignoreCase = true) }
+            }
+            if (naturalOrder) {
+                list = list.sortedWith(compareBy<SavedFile> { naturalMediaKey(it.name) }.thenBy { it.index })
+            }
+            list
+        }
+    }
+
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            TopAppBar(
+                title = { Text("Details", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    if (!busy && entry.directPlay && entry.engineId != null) {
+                        TextButton(onClick = onDrop) {
+                            Text("Drop")
+                        }
+                    }
+                    if (!busy && !entry.complete) {
+                        if (entry.paused || (entry.engineId == null && entry.lifecycleState != EntryLifecycleState.DOWNLOADING)) {
+                            TextButton(onClick = onResume) {
+                                Text("Resume")
+                            }
+                        } else {
+                            TextButton(onClick = onPause) {
+                                Text("Pause")
+                            }
+                        }
+                    }
+                    IconButton(onClick = onDelete, enabled = !busy) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Remove download",
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = colors.background,
+                    titleContentColor = colors.onBackground,
+                    navigationIconContentColor = colors.onBackground,
+                    actionIconContentColor = colors.onBackground,
+                ),
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            state = rememberLazyListState(),
+            modifier = Modifier.fillMaxSize().padding(padding),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            item {
+                DownloadSummary(
+                    entry, error,
+                    onPlay = onPlay,
+                    magnetAvailable = magnetUri != null,
+                    copiedMagnet = copiedMagnet,
+                    onShareMagnet = { magnetUri?.let { shareMagnetUri(context, it) } },
+                    onCopyMagnet = {
+                        magnetUri?.let {
+                            clipboardManager.setText(AnnotatedString(it))
+                            copiedMagnet = true
+                            Toast.makeText(context, "Magnet link copied", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                )
+            }
+            // UI-03: Playable files and episode playback precede diagnostics
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SectionTitle("Files", "${entry.selected.size} of ${files.size} selected")
+                    // A handful of files needs no search box or filters.
+                    if (files.size >= 8 || fileQuery.isNotEmpty()) OutlinedTextField(
+                        value = fileQuery,
+                        onValueChange = { fileQuery = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        placeholder = { Text("Search files and episodes", style = MaterialTheme.typography.bodyMedium) },
+                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                        trailingIcon = if (fileQuery.isNotEmpty()) {
+                            {
+                                IconButton(onClick = { fileQuery = "" }) {
+                                    Icon(Icons.Default.Clear, contentDescription = "Clear search")
+                                }
+                            }
+                        } else null,
+                    )
+                    if (files.size >= 4 || fileFilter != DetailFileFilter.ALL) Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        FilterChip(
+                            selected = fileFilter == DetailFileFilter.ALL,
+                            onClick = { fileFilter = DetailFileFilter.ALL },
+                            label = { Text("All") },
+                        )
+                        FilterChip(
+                            selected = fileFilter == DetailFileFilter.VIDEOS,
+                            onClick = { fileFilter = DetailFileFilter.VIDEOS },
+                            label = { Text("Videos") },
+                        )
+                        FilterChip(
+                            selected = fileFilter == DetailFileFilter.SUBTITLES,
+                            onClick = { fileFilter = DetailFileFilter.SUBTITLES },
+                            label = { Text("Subtitles") },
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        FilterChip(
+                            selected = naturalOrder,
+                            onClick = { naturalOrder = !naturalOrder },
+                            label = { Text(if (naturalOrder) "Episode order" else "Torrent order") },
+                        )
+                    }
+                }
+            }
+            if (displayedFiles.isEmpty()) {
+                item {
+                    Text(
+                        "No files match your search or filter.",
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
+            }
+            items(displayedFiles, key = { it.index }) { file ->
+                val stem = file.path.substringBeforeLast('.').lowercase(Locale.ROOT)
+                val fileProbe = AudioTrackProbeRepository.lookupFromMap(probesMap, entry.key, entryInfoHash, file.index)
+                val fileProbing = AudioTrackProbeRepository.entryKey(entry.key, file.index) in probingKeys
+                val canInspectFile = isInspectableContainerName(file.name) && (!file.uri.isNullOrBlank() || !entry.engineId.isNullOrBlank())
+                TorrentFileRow(
+                    file = file,
+                    isSelected = file.index in entry.selected,
+                    paused = entry.paused,
+                    canPlay = !busy && (!entry.checking || completedPlayFile(entry, file.index) != null),
+                    directPlay = entry.directPlay,
+                    onPlay = { onPlay(file.index) },
+                    onToggle = { onToggleFile(file.index) },
+                    focused = entry.focusedFile == file.index,
+                    canToggle = !busy && !entry.checking && entry.metadataReady,
+                    pairedSubtitles = subtitleMap[stem].orEmpty(),
+                    upNext = if (entry.paused) null else upNextLabel(entry.liveStatus()?.nextPreload, file.index),
+                    verifiedProbe = fileProbe,
+                    isProbingAudio = fileProbing,
+                    onInspectAudio = if (canInspectFile && fileProbe == null && !fileProbing) {
+                        {
+                            probeScope.launch {
+                                probeRepo.probeFile(
+                                    entryKey = entry.key,
+                                    infoHash = entryInfoHash,
+                                    fileIndex = file.index,
+                                    fileName = file.name,
+                                    fileLength = file.length,
+                                    engineId = entry.engineId,
+                                    contentUri = file.uri,
+                                    forceRefresh = true,
+                                )
+                            }
+                        }
+                    } else {
+                        null
+                    },
+                )
+            }
+            // Diagnostics follow files
+            item { TransferSection(entry) }
+            item { ConnectionMapSection(entry, client) }
+            item { TrackerDetailsSection(status) }
+            item {
+                PieceHeatGridSection(
+                    map = telemetry,
+                    frozen = entry.paused || entry.complete,
+                    files = entry.files,
+                    memoryBuffer = entry.directPlay,
+                )
+            }
+            item { TechnicalSection(entry, status, telemetry, entry.selected.size) }
+        }
+    }
+}
+
+@Composable
+private fun DownloadSummary(
+    entry: DownloadEntry,
+    error: String?,
+    onPlay: (Int) -> Unit,
+    magnetAvailable: Boolean,
+    copiedMagnet: Boolean,
+    onShareMagnet: () -> Unit,
+    onCopyMagnet: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    val isPaused = entry.paused || entry.lifecycleState == EntryLifecycleState.PAUSED ||
+        (entry.metadataReady && (entry.lifecycleState == EntryLifecycleState.STOPPED || entry.engineId == null))
+    val (labelBackground, labelColor) = when {
+        entry.controlsBusy() || isPaused -> colors.tertiaryContainer to colors.onTertiaryContainer
+        error != null || entry.error != null -> colors.errorContainer to colors.onErrorContainer
+        else -> colors.primaryContainer to colors.onPrimaryContainer
+    }
+    val label = downloadSummaryLabel(entry, error)
+    val video = entry.files.any { it.index in entry.selected && it.name.isVideoName() }
+    val percent = (entry.progress.coerceIn(0f, 1f) * 100).toInt()
+    ThemedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (video) EpisodeVideoPreview(entry, Modifier.fillMaxWidth().aspectRatio(16f / 9f))
+            Text(
+                entry.title,
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                color = colors.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                label,
+                Modifier
+                    .background(labelBackground, RoundedCornerShape(6.dp))
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                color = labelColor,
+            )
+            Text(
+                if (entry.checking) "Checking saved data · ${entry.checkPercent}%"
+                else if (!entry.metadataReady) "Fetching file list…"
+                else if (entry.directPlay && entry.engineId == null) "Stopped · peers disconnected and RAM freed. Play starts it again."
+                else if (entry.directPlay && entry.liveStatus()?.resting == true) "Resting · peers released while idle. Reconnects when playback resumes."
+                else if (entry.directPlay) "${formatBytes(entry.downloaded)} cached · video stays in RAM"
+                else "${formatBytes(entry.downloaded)} of ${formatBytes(entry.total)} · $percent%",
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.onSurfaceVariant,
+            )
+            transferTelemetry(entry)?.let { text ->
+                Text(text, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
+            }
+            if (!entry.complete && !entry.directPlay) {
+                LinearProgressIndicator(
+                    progress = { entry.progress.coerceIn(0f, 1f) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .clip(MaterialTheme.shapes.extraSmall),
+                    color = colors.primary,
+                    trackColor = colors.surface,
+                )
+            }
+            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = colors.error) }
+            entry.status?.warning?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = colors.tertiary) }
+            // The video most people came here for: where they left off, else the main file.
+            val resume = entry.resumeFile()
+            val playIndex = resume?.index ?: pickPlayIndex(entry)
+            val isVideo = mediaType(entry) == "Video"
+            if (playIndex != null && entry.canPlay()) {
+                Button(
+                    onClick = { onPlay(playIndex) },
+                    enabled = !entry.checking || completedPlayFile(entry, playIndex) != null,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp).heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        when {
+                            resume != null -> "Continue at ${playbackTime(resume.playbackPositionMs)}"
+                            isVideo -> "Play"
+                            else -> "Open"
+                        },
+                        maxLines = 1,
+                    )
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onShareMagnet, enabled = magnetAvailable) {
+                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Share magnet")
+                }
+                TextButton(onClick = onCopyMagnet, enabled = magnetAvailable) {
+                    Text(if (copiedMagnet) "Copied" else "Copy magnet")
+                }
+            }
+            if (!magnetAvailable) {
+                Text("Magnet link not available yet", style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TransferSection(entry: DownloadEntry) {
+    val colors = MaterialTheme.colorScheme
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionTitle("Transfer")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            TransferCard(
+                label = "Download",
+                value = entry.liveDownloadSpeed()?.let(::formatSpeed) ?: "—",
+                modifier = Modifier.weight(1f),
+            )
+            TransferCard(
+                label = "Upload",
+                value = entry.liveUploadSpeed()?.let(::formatSpeed) ?: "—",
+                modifier = Modifier.weight(1f),
+            )
+            TransferCard(
+                label = "ETA",
+                value = formatEta(entry.selectedEta()) ?: "—",
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Text(
+            entry.liveStatus()?.let { formatPeers(it.numPeers) } ?: "Peers —",
+            style = MaterialTheme.typography.labelSmall,
+            color = colors.onSurfaceVariant,
+            modifier = Modifier.padding(start = 2.dp),
+        )
+    }
+}
+
+@Composable
+private fun TransferCard(label: String, value: String, modifier: Modifier = Modifier) {
+    val colors = MaterialTheme.colorScheme
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = colors.surfaceContainer),
+    ) {
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                value,
+                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                color = colors.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TrackerDetailsSection(status: webtor.core.TorrentStatus?) {
+    val colors = MaterialTheme.colorScheme
+    val trackers = status?.trackers.orEmpty()
+    var expanded by remember(status?.id) { mutableStateOf(false) }
+    val working = trackers.count {
+        it.status.equals("working", true) || it.status.equals("connected", true) || it.status.equals("ok", true)
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = colors.surfaceContainer),
+    ) {
+        Column {
+            TextButton(
+                onClick = { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    when {
+                        trackers.isEmpty() -> "Connection details · unavailable"
+                        else -> "Connection details · $working/${trackers.size} trackers responding"
+                    },
+                    modifier = Modifier.weight(1f),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Start,
+                    color = colors.onSurface,
+                )
+                Text(if (expanded) "Hide" else "Show", color = colors.primary)
+            }
+            if (expanded) {
+                if (trackers.isEmpty()) {
+                    Text(
+                        "Tracker status is not available yet.",
+                        modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 12.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.onSurfaceVariant,
+                    )
+                } else {
+                    Column(
+                        modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        trackers.take(MAX_TRACKERS_SHOWN).forEach { tracker ->
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    redactedTrackerUrl(tracker.url),
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = colors.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    tracker.status,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (tracker.status.equals("error", true)) colors.error else colors.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        if (trackers.size > MAX_TRACKERS_SHOWN) {
+                            Text(
+                                "+${trackers.size - MAX_TRACKERS_SHOWN} more",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colors.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private const val MAX_TRACKERS_SHOWN = 12
+
+@Composable
+private fun SectionTitle(title: String, subtitle: String? = null) {
+    val colors = MaterialTheme.colorScheme
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            title,
+            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+            color = colors.onBackground,
+            modifier = Modifier.weight(1f),
+        )
+        subtitle?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TorrentFileRow(
+    file: SavedFile,
+    isSelected: Boolean,
+    paused: Boolean,
+    canPlay: Boolean,
+    onPlay: () -> Unit,
+    onToggle: () -> Unit,
+    canToggle: Boolean,
+    focused: Boolean = false,
+    directPlay: Boolean = false,
+    pairedSubtitles: List<String> = emptyList(),
+    upNext: String? = null,
+    verifiedProbe: ContainerProbeResult? = null,
+    isProbingAudio: Boolean = false,
+    onInspectAudio: (() -> Unit)? = null,
+) {
+    val colors = MaterialTheme.colorScheme
+    val isVideo = file.name.isVideoName() || file.path.isVideoName()
+    val isSub = file.name.isSubtitleName() || file.path.isSubtitleName()
+    val complete = !directPlay && file.isVerifiedComplete
+    val canPlayVideo = isVideo && (directPlay || !file.uri.isNullOrBlank()) && (isSelected || complete)
+    val canOpenOther = !isVideo && (isSelected || complete) && !file.uri.isNullOrBlank() && complete
+    val showPriority = isSelected && !directPlay && !complete
+    val priorityDownload = focused && showPriority
+    val folder = parentFolderLabel(file.name, file.path)
+    val watched = if (isVideo && showsPlaybackBar(file.playbackPositionMs, file.playbackDurationMs)) {
+        playbackFraction(file.playbackPositionMs, file.playbackDurationMs)
+    } else {
+        null
+    }
+    val statusText = when {
+        !isSelected -> "Not selected"
+        directPlay -> if (paused) "Direct Play · paused" else "Direct Play"
+        file.uri.isNullOrBlank() -> "Not downloaded"
+        complete -> "Ready"
+        paused -> "Paused"
+        else -> "Downloading"
+    }
+    var tracksExpanded by remember(file.index) { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(containerColor = colors.surfaceContainerLow),
+        border = BorderStroke(
+            1.dp,
+            if (priorityDownload) colors.primary else colors.outlineVariant.copy(alpha = 0.6f),
+        ),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Checkbox(
+                    checked = isSelected,
+                    onCheckedChange = { if (canToggle) onToggle() },
+                    enabled = canToggle,
+                    modifier = Modifier.size(48.dp),
+                )
+                Column(Modifier.weight(1f).padding(top = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            file.name,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = colors.onSurface,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            detailTypeLabel(file.name, file.path),
+                            modifier = Modifier.padding(top = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.onSurfaceVariant,
+                            maxLines = 1,
+                        )
+                    }
+                    folder?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (priorityDownload) {
+                        Text("Priority download", style = MaterialTheme.typography.labelSmall, color = colors.primary)
+                    }
+                    upNext?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = colors.tertiary) }
+                    watched?.let { fraction ->
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(2.dp)
+                                .clip(MaterialTheme.shapes.extraSmall)
+                                .background(colors.surfaceContainerHighest),
+                        ) {
+                            Box(
+                                Modifier
+                                    .fillMaxHeight()
+                                    .fillMaxWidth(fraction)
+                                    .background(colors.secondary),
+                            )
+                        }
+                    }
+                    Text(
+                        if (directPlay) "${formatBytes(file.length)} · $statusText"
+                        else "${formatBytes((file.length * file.progress).toLong())} of ${formatBytes(file.length)} · $statusText",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colors.onSurfaceVariant,
+                    )
+                    if (isVideo && (verifiedProbe != null || isProbingAudio)) {
+                        VerifiedAudioSummaryPill(
+                            probe = verifiedProbe,
+                            isProbing = isProbingAudio,
+                            expanded = if (verifiedProbe != null) tracksExpanded else null,
+                            onClick = if (verifiedProbe != null) {
+                                { tracksExpanded = !tracksExpanded }
+                            } else {
+                                null
+                            },
+                        )
+                    } else if (isVideo && onInspectAudio != null) {
+                        Surface(
+                            modifier = Modifier.clickable(onClick = onInspectAudio),
+                            shape = RoundedCornerShape(6.dp),
+                            color = colors.surfaceContainerHighest,
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Audiotrack,
+                                    contentDescription = "Inspect audio tracks",
+                                    tint = colors.primary,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                                Text(
+                                    "Check audio tracks",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = colors.primary,
+                                )
+                            }
+                        }
+                    }
+                    if (pairedSubtitles.isNotEmpty()) {
+                        Text(
+                            "Subtitles: ${pairedSubtitles.joinToString(", ")}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    } else if (isSub) {
+                        Text(
+                            "External subtitle",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.tertiary,
+                        )
+                    }
+                }
+            }
+            if (isSelected && !complete && !directPlay) {
+                LinearProgressIndicator(
+                    progress = { file.progress.toFloat().coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth().height(3.dp).clip(MaterialTheme.shapes.extraSmall),
+                    color = colors.primary,
+                    trackColor = colors.surfaceContainerHighest,
+                )
+            }
+            AnimatedVisibility(visible = tracksExpanded && verifiedProbe != null) {
+                verifiedProbe?.let { probe ->
+                    InlineTrackBreakdownPanel(probe = probe)
+                }
+            }
+            if (canPlayVideo || canOpenOther) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                    FilledTonalButton(
+                        onClick = onPlay,
+                        enabled = canPlay,
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.height(36.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    ) {
+                        if (isVideo) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        Text(
+                            if (isVideo) "Play" else "Open",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TechnicalSection(
+    entry: DownloadEntry,
+    status: webtor.core.TorrentStatus?,
+    telemetry: PieceTelemetry?,
+    selectedCount: Int,
+) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+    val infoHash = status?.infoHash ?: entry.key.takeIf { it.length == 40 } ?: "—"
+    val pieceDetails = telemetry?.let { "${it.totalPieces} pieces · ${formatBytes(it.pieceLength)} each" } ?: "—"
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionTitle("Technical information")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            TechnicalCard(
+                label = "Files",
+                value = "$selectedCount of ${entry.files.size} selected",
+                modifier = Modifier.weight(1f),
+            )
+            TechnicalCard(
+                label = "Pieces",
+                value = pieceDetails,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        TechnicalCard(
+            label = "Destination",
+            value = entry.destination,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        TechnicalCard(
+            label = "Info hash (tap to copy)",
+            value = infoHash,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = infoHash != "—") {
+                    clipboardManager.setText(AnnotatedString(infoHash))
+                    Toast.makeText(context, "Info hash copied", Toast.LENGTH_SHORT).show()
+                },
+            monospace = true,
+        )
+    }
+}
+
+@Composable
+private fun TechnicalCard(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    monospace: Boolean = false,
+) {
+    val colors = MaterialTheme.colorScheme
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = colors.surfaceContainer),
+    ) {
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(label, style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
+            Text(
+                value,
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.onSurface,
+                fontFamily = if (monospace) FontFamily.Monospace else FontFamily.Default,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/** Play next warm-up state for the row of [fileIndex]; null for other rows. */
+internal fun upNextLabel(preload: webtor.core.NextPreload?, fileIndex: Int): String? = when {
+    preload == null || preload.fileIndex != fileIndex -> null
+    preload.ready -> "Up next · start loaded"
+    preload.active -> "Up next · loading start"
+    else -> "Up next · loads near the end"
+}

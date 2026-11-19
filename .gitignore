@@ -1,0 +1,62 @@
+# Gradle & Kotlin
+.gradle/
+.kotlin/
+build/
+*/build/
+**/build/
+*.log
+*.class
+
+# Android Studio & JetBrains IDEs
+.idea/
+.vscode/
+*.iml
+.navigation/
+captures/
+.claude/
+.gemini/
+
+# Python test helpers
+__pycache__/
+*.pyc
+
+# Local environment & signing secrets (NEVER commit)
+local.properties
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+google-services.json
+
+# Built Android packages & bytecode
+*.apk
+*.ap_
+*.aab
+*.dex
+*.ipk
+
+# Native NDK & Rust Cargo outputs (libengine.so is compiled by :app:buildRustEngine)
+.cxx/
+.externalNativeBuild/
+**/target/
+app/src/main/jniLibs/**/*.so
+
+# Profiler, Lint & crash logs
+hs_err_pid*
+replay_pid*
+*.hprof
+.cache/
+
+# OS & temporary files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
