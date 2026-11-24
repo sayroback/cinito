@@ -30,9 +30,11 @@ enum class ProbeProfile(
     val postReadySampleWindowMs: Long,
     val earlyDeadAbortMs: Long?,
     val unchokeGraceMs: Long = 0L,
+    /** Espera mínima sin peers antes de cortar por early-dead, meta-timeout o tope (ver isProbeWarming). */
+    val warmupWindowMs: Long = 0L,
 ) {
-    USER_CLICK(6_500L, 2_400L, 4_000L, 1_400L),
-    BACKGROUND_SCAN(4_500L, 1_800L, 4_000L, 1_000L),
+    USER_CLICK(6_500L, 2_400L, 4_000L, 1_400L, 8_000L),
+    BACKGROUND_SCAN(4_500L, 1_800L, 4_000L, 1_000L, 15_000L),
 }
 
 /**
@@ -59,6 +61,14 @@ class SwarmDiagnosticsCoordinator(
     private val cache = ConcurrentHashMap<String, CachedProbe>()
     private val claimedHashes = ConcurrentHashMap<String, Long>()
     private val activeProbeJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * Ventana de calentamiento por prueba: mientras [elapsedMs] < [ProbeProfile.warmupWindowMs],
+     * no se cortan pruebas por tope, early-dead ni meta-timeout. Los candidatos (DHT/PEX/trackers)
+     * pueden tardar más que el corte fijo; con el corte antiguo la prueba marcaba FAIL sin darles tiempo.
+     */
+    private fun isProbeWarming(elapsedMs: Long, profile: ProbeProfile, isTemporary: Boolean, isCustomTestConfig: Boolean): Boolean =
+        isTemporary && !isCustomTestConfig && elapsedMs < profile.warmupWindowMs
 
     private class PriorityProbeGate {
         private val semaphore = Semaphore(1)
@@ -325,6 +335,9 @@ class SwarmDiagnosticsCoordinator(
         val hasCustomMaxDuration = maxProbeDurationMs != DEFAULT_MAX_PROBE_DURATION_MS
         val isCustomTestConfig = hasCustomMaxDuration || postReadySampleWindowMs != DEFAULT_POST_READY_SAMPLE_MS
         val startedAt = clockMs()
+        if (isTemporary && !isCustomTestConfig) {
+            Log.i(TAG, "warmup start hash=${hash.take(8)} profile=${profile.name} windowMs=${profile.warmupWindowMs}")
+        }
         var firstReadyAtMs: Long? = null
         var streamConfiguredAtMs: Long? = null
         var baselineDownloaded = 0L
@@ -438,12 +451,13 @@ class SwarmDiagnosticsCoordinator(
                 }
 
                 val elapsed = (clockMs() - startedAt).coerceAtLeast(0L)
+                val warming = isProbeWarming(elapsed, profile, isTemporary, isCustomTestConfig)
                 if (isTemporary && status.downloaded >= maxByteBudget) {
                     stopReason = "byte-budget"
                     break
                 }
                 // Tope global: ninguna prueba sin config custom dura más de maxDuration + 2,5 s.
-                if (!isCustomTestConfig && elapsed >= effectiveMaxDurationMs + HARD_CAP_EXTRA_MS) {
+                if (!isCustomTestConfig && !warming && elapsed >= effectiveMaxDurationMs + HARD_CAP_EXTRA_MS) {
                     stopReason = "hard-cap"
                     break
                 }
@@ -451,6 +465,7 @@ class SwarmDiagnosticsCoordinator(
                 if (readyAt == null) {
                     // Phase 1: waiting for magnet metadata.
                     if (profile.earlyDeadAbortMs != null &&
+                        !warming &&
                         elapsed >= profile.earlyDeadAbortMs &&
                         peakPeers == 0 &&
                         peakSpeedBps == 0L &&
@@ -459,7 +474,7 @@ class SwarmDiagnosticsCoordinator(
                         stopReason = "early-dead-meta"
                         break
                     }
-                    if (elapsed >= effectiveMaxDurationMs) {
+                    if (!warming && elapsed >= effectiveMaxDurationMs) {
                         stopReason = "meta-timeout"
                         break
                     }

@@ -1439,7 +1439,50 @@ class SearchServiceTest {
     }
 
     @Test
-    fun bestPlayabilityPrioritizeLatinoRanksVerifiedFlowAboveUntestedLatinoAndVerifiedLatinoAboveVerifiedOther() {
+    fun explicitSortOrderIsHonoredWithinEachLanguageTierWhenPrioritizingLatino() {
+        val latinoLow = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Movie.2025.1080p.Latino",
+            magnetUri = SearchUtils.buildMagnet("4444444444444444444444444444444444444444", "LatinoLow"),
+            seeders = 10,
+        )
+        val latinoHigh = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Movie.2025.1080p.Latino",
+            magnetUri = SearchUtils.buildMagnet("5555555555555555555555555555555555555555", "LatinoHigh"),
+            seeders = 50,
+        )
+        val otherHigh = SearchUtils.makeResult(
+            providerId = "yts",
+            providerName = "YTS",
+            title = "Movie.2025.1080p.WEB-DL",
+            magnetUri = SearchUtils.buildMagnet("6666666666666666666666666666666666666666", "OtherHigh"),
+            seeders = 300,
+        )
+        val otherLow = SearchUtils.makeResult(
+            providerId = "yts",
+            providerName = "YTS",
+            title = "Movie.2025.1080p.WEB-DL",
+            magnetUri = SearchUtils.buildMagnet("7777777777777777777777777777777777777777", "OtherLow"),
+            seeders = 100,
+        )
+
+        val sorted = SearchService.applyLanguageFilterAndSort(
+            listOf(latinoLow, otherHigh, otherLow, latinoHigh),
+            SearchSortOrder.SeedersDesc,
+            SearchLanguageFilter.PrioritizeLatino,
+        )
+
+        assertEquals(
+            listOf(latinoHigh.id, latinoLow.id, otherHigh.id, otherLow.id),
+            sorted.map { it.id },
+        )
+    }
+
+    @Test
+    fun bestPlayabilityPrioritizeLatinoGroupsByLanguageTierThenRanksVerifiedFlowWithinTier() {
         val hashUntestedLatino = "1111111111111111111111111111111111111111"
         val hashVerifiedOther = "2222222222222222222222222222222222222222"
         val hashVerifiedLatino = "3333333333333333333333333333333333333333"
@@ -1500,7 +1543,7 @@ class SearchServiceTest {
         )
 
         assertEquals(
-            listOf(verifiedLatino.id, verifiedOther.id, untestedLatino.id),
+            listOf(verifiedLatino.id, untestedLatino.id, verifiedOther.id),
             sorted.map { it.id },
         )
     }

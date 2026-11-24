@@ -362,4 +362,50 @@ class SwarmDiagnosticsCoordinatorTest {
         assertFalse(probe?.isVerifiedLive == true)
         assertEquals(1, removeCalls.get())
     }
+
+    @Test
+    fun probeWaitsWarmupWindowForLatePeersAndCutsOnlyAfterIt() = runBlocking {
+        var nowMs = 1_000L
+        var peersOn = true
+        val transport = EngineTransport { method, path, body ->
+            when {
+                method == "POST" && path == "/add" -> EngineResponse(200, """{"id":"probe-warm","infoHash":"$sampleHash"}""")
+                method == "GET" && path == "/torrent/probe-warm" -> {
+                    val peers = if (peersOn && nowMs >= 7_000L) 3 else 0
+                    EngineResponse(
+                        200,
+                        """{"id":"probe-warm","infoHash":"$sampleHash","ready":false,"done":false,"paused":false,"progress":0.0,"downloadSpeed":0,"uploadSpeed":0,"numPeers":$peers,"connectedSeeders":0,"length":0,"downloaded":0,"uploaded":0,"files":[]}""",
+                    )
+                }
+                method == "GET" && path == "/connections/probe-warm" -> EngineResponse(200, """{"id":"probe-warm","paused":false,"peers":[]}""")
+                method == "POST" && path == "/remove" -> EngineResponse(200, """{"ok":true}""")
+                else -> error("Unexpected transport call: $method $path")
+            }
+        }
+        val coordinator = SwarmDiagnosticsCoordinator(
+            engineClient = EngineClient(transport),
+            clockMs = { nowMs },
+            delayFn = { dt -> nowMs += dt },
+            pollIntervalMs = 200L,
+        )
+
+        // Los peers llegan a los 7 s, después del corte antiguo de 4 s: la ventana de BACKGROUND_SCAN (15 s) los espera.
+        val late = coordinator.probeSingle(sampleResult(), profile = ProbeProfile.BACKGROUND_SCAN)
+        assertEquals(3, late?.activePeers)
+
+        // Sin peers: BACKGROUND_SCAN agota su ventana de 15 s antes de cortar.
+        peersOn = false
+        val bgStart = nowMs
+        val bg = coordinator.probeSingle(sampleResult(hash = "b".repeat(40)), profile = ProbeProfile.BACKGROUND_SCAN)
+        assertEquals(0, bg?.activePeers)
+        val bgDuration = nowMs - bgStart
+        assertTrue("background debe esperar ~15 s, duró $bgDuration ms", bgDuration in 14_800L..16_500L)
+
+        // USER_CLICK: ventana de 8 s.
+        val userStart = nowMs
+        val user = coordinator.probeSingle(sampleResult(hash = "c".repeat(40)), profile = ProbeProfile.USER_CLICK)
+        assertEquals(0, user?.activePeers)
+        val userDuration = nowMs - userStart
+        assertTrue("usuario debe esperar ~8 s, duró $userDuration ms", userDuration in 7_800L..9_500L)
+    }
 }

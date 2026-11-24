@@ -612,13 +612,13 @@ class SearchService(
             val baseSorted = sortResults(filtered, sortOrder, assessments)
             if (languageFilter != SearchLanguageFilter.PrioritizeLatino) return baseSorted to assessments
 
-            // When prioritizing Latino in BestPlayability, push Dead (0 live seeders) below playable releases
-            // and rank Tier 0 (verified live flow) ahead of Tier 1 (unprobed/unverified)
+            // When prioritizing Latino in BestPlayability, push Dead (0 live seeders) below playable releases,
+            // then group by language tier, and rank the best options (verified flow, score) within each tier
             val finalSorted = if (sortOrder == SearchSortOrder.BestPlayability) {
                 baseSorted.sortedWith(
                     compareBy<TorrentSearchResult> { assessments[it.id]?.verdict == PlayabilityVerdict.Dead }
-                        .thenBy { !hasVerifiedFlow(assessments[it.id]) }
                         .thenBy { tagPriority(it.languageTag) }
+                        .thenBy { !hasVerifiedFlow(assessments[it.id]) }
                         .thenByDescending { assessments[it.id]?.score ?: 0 }
                         .thenByDescending { assessments[it.id]?.probe?.measuredDownloadBps ?: 0L }
                         .thenByDescending { assessments[it.id]?.effectiveSeeders ?: it.seeders },
