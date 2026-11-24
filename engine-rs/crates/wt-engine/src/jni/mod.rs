@@ -76,13 +76,39 @@ pub(crate) fn log_error(msg: &str) {
     }
 }
 
+pub(crate) fn log_warn(msg: &str) {
+    #[cfg(target_os = "android")]
+    {
+        log::warn!(target: "webtor-engine", "{msg}");
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        eprintln!("[webtor-engine] WARN {msg}");
+    }
+}
+
+/// High-frequency diagnostics: `log` facade only, so host builds stay quiet
+/// unless a logger is installed.
+pub(crate) fn log_debug(msg: &str) {
+    log::debug!(target: "webtor-engine", "{msg}");
+}
+
+/// Text of a caught panic payload, for the error log.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
 #[cfg(target_os = "android")]
 fn init_android_logging() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let _ = android_logger::init_once(
             android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Info)
+                .with_max_level(log::LevelFilter::Debug)
                 .with_tag("webtor-engine"),
         );
         // catch_unwind keeps the process alive but drops the message; log it.
@@ -101,7 +127,13 @@ fn java_string(env: &mut JNIEnv<'_>, value: JString<'_>) -> String {
     if value.is_null() {
         return String::new();
     }
-    env.get_string(&value).map(|s| s.into()).unwrap_or_default()
+    match env.get_string(&value) {
+        Ok(s) => s.into(),
+        Err(err) => {
+            log_error(&format!("java string read failed: {err}"));
+            String::new()
+        }
+    }
 }
 
 fn java_bytes(env: &mut JNIEnv<'_>, value: &JByteArray<'_>) -> Vec<u8> {
@@ -110,13 +142,17 @@ fn java_bytes(env: &mut JNIEnv<'_>, value: &JByteArray<'_>) -> Vec<u8> {
     }
     let len = match env.get_array_length(value) {
         Ok(n) => n as usize,
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            log_error(&format!("java byte array length failed: {err}"));
+            return Vec::new();
+        }
     };
     if len == 0 {
         return Vec::new();
     }
     let mut buf = vec![0i8; len];
-    if env.get_byte_array_region(value, 0, &mut buf).is_err() {
+    if let Err(err) = env.get_byte_array_region(value, 0, &mut buf) {
+        log_error(&format!("java byte array read failed len={len}: {err}"));
         return Vec::new();
     }
     buf.into_iter().map(|b| b as u8).collect()
@@ -125,7 +161,10 @@ fn java_bytes(env: &mut JNIEnv<'_>, value: &JByteArray<'_>) -> Vec<u8> {
 fn new_java_bytes(env: &mut JNIEnv<'_>, data: &[u8]) -> jbyteArray {
     match env.byte_array_from_slice(data) {
         Ok(arr) => arr.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(err) => {
+            log_error(&format!("java byte array alloc failed len={}: {err}", data.len()));
+            std::ptr::null_mut()
+        }
     }
 }
 
@@ -147,8 +186,8 @@ pub extern "system" fn Java_webtor_app_EngineHost_startEngine(
     }));
     match result {
         Ok(code) => code,
-        Err(_) => {
-            log_error("startEngine panicked");
+        Err(payload) => {
+            log_error(&format!("startEngine panicked: {}", panic_text(&*payload)));
             1
         }
     }
@@ -167,16 +206,22 @@ pub extern "system" fn Java_webtor_app_EngineHost_requestEngine(
         let method = java_string(&mut env, method);
         let path = java_string(&mut env, path);
         let body = java_bytes(&mut env, &body);
+        log_debug(&format!("requestEngine enter {method} {path} bodyLen={}", body.len()));
         let payload = match current_engine() {
             Some(engine) => engine.request_engine(&method, &path, &body),
-            None => b"503\n{\"error\":\"engine is starting\"}".to_vec(),
+            None => {
+                log_warn(&format!("requestEngine {method} {path}: engine not started, returning 503"));
+                b"503\n{\"error\":\"engine is starting\"}".to_vec()
+            }
         };
+        let status = payload.split(|&b| b == b'\n').next().unwrap_or_default();
+        log_debug(&format!("requestEngine exit {method} {path} status={}", String::from_utf8_lossy(status)));
         new_java_bytes(&mut env, &payload)
     }));
     match result {
         Ok(arr) => arr,
-        Err(_) => {
-            log_error("requestEngine panicked");
+        Err(payload) => {
+            log_error(&format!("requestEngine panicked: {}", panic_text(&*payload)));
             new_java_bytes(&mut env, b"500\n{\"error\":\"native panic\"}")
         }
     }
@@ -199,8 +244,8 @@ pub extern "system" fn Java_webtor_app_EngineHost_waitForEngineEvent(
     }));
     match result {
         Ok(v) => v,
-        Err(_) => {
-            log_error("waitForEngineEvent panicked");
+        Err(payload) => {
+            log_error(&format!("waitForEngineEvent panicked: {}", panic_text(&*payload)));
             after_version
         }
     }
@@ -215,16 +260,21 @@ pub extern "system" fn Java_webtor_app_EngineHost_openPlayback(
     index: jint,
 ) -> jlong {
     let result = catch_unwind(AssertUnwindSafe(|| {
+        let id = java_string(&mut env, id);
+        log_debug(&format!("openPlayback enter id={id} index={index}"));
         let Some(engine) = current_engine() else {
+            log_error(&format!("openPlayback id={id} index={index}: engine not started"));
             return 0;
         };
-        let id = java_string(&mut env, id);
         engine.open_playback(&id, index)
     }));
     match result {
-        Ok(handle) => handle,
-        Err(_) => {
-            log_error("openPlayback panicked");
+        Ok(handle) => {
+            log_debug(&format!("openPlayback exit index={index} handle={handle}"));
+            handle
+        }
+        Err(payload) => {
+            log_error(&format!("openPlayback panicked: {}", panic_text(&*payload)));
             0
         }
     }
@@ -248,9 +298,11 @@ pub extern "system" fn Java_webtor_app_EngineHost_readPlayback(
             return -1;
         };
         if !(0..=MAX_READ_SIZE).contains(&size) || size > array_len {
+            log_warn(&format!("readPlayback handle={handle} invalid size={size} arrayLen={array_len}"));
             return -1;
         }
         let Some(engine) = current_engine() else {
+            log_warn(&format!("readPlayback handle={handle}: engine not started"));
             return -1;
         };
         let mut buf = vec![0u8; size as usize];
@@ -259,7 +311,8 @@ pub extern "system" fn Java_webtor_app_EngineHost_readPlayback(
             // One buffer: reinterpret u8 → i8 for SetByteArrayRegion (same layout).
             let signed =
                 unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), n as usize) };
-            if env.set_byte_array_region(&target, 0, signed).is_err() {
+            if let Err(err) = env.set_byte_array_region(&target, 0, signed) {
+                log_error(&format!("readPlayback handle={handle} copy-out failed n={n}: {err}"));
                 return -1;
             }
         }
@@ -267,8 +320,8 @@ pub extern "system" fn Java_webtor_app_EngineHost_readPlayback(
     }));
     match result {
         Ok(n) => n,
-        Err(_) => {
-            log_error("readPlayback panicked");
+        Err(payload) => {
+            log_error(&format!("readPlayback panicked: {}", panic_text(&*payload)));
             -1
         }
     }
@@ -281,11 +334,14 @@ pub extern "system" fn Java_webtor_app_EngineHost_closePlayback(
     _host: JObject,
     handle: jlong,
 ) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    log_debug(&format!("closePlayback handle={handle}"));
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
         if let Some(engine) = current_engine() {
             engine.close_playback(handle);
         }
-    }));
+    })) {
+        log_error(&format!("closePlayback handle={handle} panicked: {}", panic_text(&*payload)));
+    }
 }
 
 /// `Java_webtor_app_EngineHost_openPreview`
@@ -297,16 +353,21 @@ pub extern "system" fn Java_webtor_app_EngineHost_openPreview(
     index: jint,
 ) -> jlong {
     let result = catch_unwind(AssertUnwindSafe(|| {
+        let id = java_string(&mut env, id);
+        log_debug(&format!("openPreview enter id={id} index={index}"));
         let Some(engine) = current_engine() else {
+            log_error(&format!("openPreview id={id} index={index}: engine not started"));
             return 0;
         };
-        let id = java_string(&mut env, id);
         engine.open_preview(&id, index)
     }));
     match result {
-        Ok(handle) => handle,
-        Err(_) => {
-            log_error("openPreview panicked");
+        Ok(handle) => {
+            log_debug(&format!("openPreview exit index={index} handle={handle}"));
+            handle
+        }
+        Err(payload) => {
+            log_error(&format!("openPreview panicked: {}", panic_text(&*payload)));
             0
         }
     }
@@ -330,20 +391,24 @@ pub extern "system" fn Java_webtor_app_EngineHost_readPreview(
             return -1;
         };
         if !(0..=MAX_READ_SIZE).contains(&size) || size > array_len {
+            log_warn(&format!("readPreview handle={handle} invalid size={size} arrayLen={array_len}"));
             return -1;
         }
         let Some(engine) = current_engine() else {
+            log_warn(&format!("readPreview handle={handle}: engine not started"));
             return -1;
         };
         let mut buf = vec![0u8; size as usize];
         let n = engine.read_preview(handle, offset, &mut buf);
         if n < 0 {
+            // server_impl logs the reader error text ("preview read: ...").
             return -1;
         }
         if n > 0 {
             let signed =
                 unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), n as usize) };
-            if env.set_byte_array_region(&target, 0, signed).is_err() {
+            if let Err(err) = env.set_byte_array_region(&target, 0, signed) {
+                log_error(&format!("readPreview handle={handle} copy-out failed n={n}: {err}"));
                 return -1;
             }
         }
@@ -351,8 +416,8 @@ pub extern "system" fn Java_webtor_app_EngineHost_readPreview(
     }));
     match result {
         Ok(n) => n,
-        Err(_) => {
-            log_error("readPreview panicked");
+        Err(payload) => {
+            log_error(&format!("readPreview panicked: {}", panic_text(&*payload)));
             -1
         }
     }
@@ -365,11 +430,14 @@ pub extern "system" fn Java_webtor_app_EngineHost_closePreview(
     _host: JObject,
     handle: jlong,
 ) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    log_debug(&format!("closePreview handle={handle}"));
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
         if let Some(engine) = current_engine() {
             engine.close_preview(handle);
         }
-    }));
+    })) {
+        log_error(&format!("closePreview handle={handle} panicked: {}", panic_text(&*payload)));
+    }
 }
 
 /// Exported symbol names expected in `libengine.so` (for tests).

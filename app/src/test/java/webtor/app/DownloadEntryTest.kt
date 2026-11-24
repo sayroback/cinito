@@ -387,10 +387,10 @@ class DownloadEntryTest {
         val t = webtor.core.TorrentStatus("id", null, null, null, true, false, false,
             0.0, 0, 0, 0, 100, 0, 0, emptyList())
         val draft = PrepareDraft("id", "magnet:x", t, emptySet())
-        assertEquals("Files ready · 0 peers", prefetchStatus(draft))
-        assertEquals("Finding peers…", prefetchStatus(draft.copy(torrent = null)))
-        assertEquals("Files ready · 2 peers", prefetchStatus(draft.copy(torrent = t.copy(numPeers = 2))))
-        assertEquals("Files ready · 0 peers", prefetchStatus(draft.copy(torrent = t.copy(downloaded = 10))))
+        assertEquals("Files ready · 0 peers · ↓ 0 B/s", prefetchStatus(draft))
+        assertEquals("Finding peers… · ↓ 0 B/s", prefetchStatus(draft.copy(torrent = null)))
+        assertEquals("Files ready · 2 peers · ↓ 0 B/s", prefetchStatus(draft.copy(torrent = t.copy(numPeers = 2))))
+        assertEquals("Files ready · 0 peers · ↓ 0 B/s", prefetchStatus(draft.copy(torrent = t.copy(downloaded = 10))))
         assertEquals(null, prefetchStatus(null))
     }
 

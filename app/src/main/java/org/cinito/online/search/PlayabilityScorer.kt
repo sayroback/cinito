@@ -34,9 +34,19 @@ data class SwarmProbeResult(
     val targetFileSizeBytes: Long? = null,
     val errorMessage: String? = null,
     val measuredAtMs: Long = 0L,
+    val isPolicyBlocked: Boolean = false,
 ) {
     val measuredMbps: Double
         get() = (measuredDownloadBps.coerceAtLeast(0L) * 8.0) / 1_000_000.0
+
+    /** Prueba real con flujo, semillas o peers y sin error. Criterio único para scorer y UI. */
+    val isVerifiedLive: Boolean
+        get() = !isPolicyBlocked && errorMessage == null &&
+            (measuredDownloadBps > 0L || (connectedSeeders ?: 0) > 0 || activePeers > 0)
+
+    /** Prueba real que no logró flujo: timeout, sin peers, peers sin datos o error de motor. */
+    val isFailed: Boolean
+        get() = !isPolicyBlocked && !isVerifiedLive
 }
 
 data class PlayabilityContext(
@@ -90,6 +100,7 @@ object PlayabilityScorer {
     private val CAM_REGEX = Regex("""(?i)\b(hdcam|camrip|cam|hdts|telesync|telecine|workprint|wp|scr|screener|ts)\b""")
     private val HEAVY_AUDIO_REGEX = Regex("""(?i)\b(truehd|dts(?:-hd)?|dts-ma|pcm)\b""")
     private val LEGACY_CONTAINER_REGEX = Regex("""(?i)\.(avi|divx|xvid|iso|rar)\b|\b(xvid|divx)\b""")
+    private val NON_VIDEO_PACK_REGEX = Regex("""(?i)\b(photoset|imageset|picture\s*set|photobook|gallery)\b|\.(zip|7z|cbr|cbz|pdf)\b""")
     private val BROWSER_FRAGILE_VIDEO_REGEX = Regex("""(?i)\b(x265|h\.?265|hevc|av1|10bit|dolby\.?vision|\bdv\b)\b""")
 
     fun evaluate(
@@ -129,14 +140,15 @@ object PlayabilityScorer {
 
         val liveSeedersFromProbe = probe?.connectedSeeders ?: 0
         val hasMeasuredFlow = (probe?.measuredDownloadBps ?: 0L) > 0L
-        if (effSeeders <= 0 && liveSeedersFromProbe <= 0 && !hasMeasuredFlow) {
-            val deadReason = if (isLiveScraped) {
-                "Trackers vivos reportan 0 semillas"
-            } else {
-                "0 semillas reportadas"
+        val probeConfirmedDead = probe?.isFailed == true
+        if (probeConfirmedDead || (effSeeders <= 0 && liveSeedersFromProbe <= 0 && !hasMeasuredFlow)) {
+            val deadReason = when {
+                probeConfirmedDead -> "Sondeo confirmó 0 flujo y 0 semillas"
+                isLiveScraped -> "Trackers vivos reportan 0 semillas"
+                else -> "0 semillas reportadas"
             }
             return PlayabilityAssessment(
-                score = if (effPeers > 0) 8 else 2,
+                score = if (probeConfirmedDead) 1 else if (effPeers > 0) 8 else 2,
                 verdict = PlayabilityVerdict.Dead,
                 estimatedBitrateMbps = estimatedBitrateMbps,
                 effectiveSeeders = 0,
@@ -153,6 +165,11 @@ object PlayabilityScorer {
         val supplyRef = maxOf(effSeeders, liveSeedersFromProbe)
         val supplyPts = (ln(1.0 + supplyRef.toDouble()) / ln(80.0)).coerceIn(0.0, 1.0) * 42.0
         score += supplyPts
+        if (isLiveScraped) {
+            score += 6.0
+        } else if (supplyRef > 50 && (result.providerId == "solidtorrents" || result.providerId == "bitsearch")) {
+            score -= 8.0
+        }
 
         // 2. Bitrate-vs-seeder viability
         var forceRisky = false
@@ -189,7 +206,7 @@ object PlayabilityScorer {
         if (effPeers > 0) {
             val ratio = supplyRef.toDouble() / effPeers.toDouble()
             when {
-                effPeers >= 20 && ratio < 0.25 -> {
+                effPeers >= 20 && ratio < 0.25 && supplyRef < 50 -> {
                     score -= 10.0
                     reasons += "Mucha congestión de leechers"
                 }
@@ -219,6 +236,12 @@ object PlayabilityScorer {
             score -= 18.0
             forceRisky = true
             reasons += "Formato antiguo / comprimido"
+        }
+
+        if (NON_VIDEO_PACK_REGEX.containsMatchIn(result.title)) {
+            score -= 35.0
+            forceRisky = true
+            reasons += "Pack de imágenes / archivo"
         }
 
         // 5. Cast / device compatibility hints
@@ -293,7 +316,7 @@ object PlayabilityScorer {
                 else -> PlayabilityVerdict.Risky
             }
             forceRisky -> PlayabilityVerdict.Risky
-            finalScore >= 70 && supplyRef >= 8 -> PlayabilityVerdict.Optimal
+            finalScore >= 70 && supplyRef >= 20 -> PlayabilityVerdict.Optimal
             finalScore >= 45 && supplyRef >= 3 -> PlayabilityVerdict.Good
             else -> PlayabilityVerdict.Risky
         }
@@ -311,6 +334,16 @@ object PlayabilityScorer {
         )
     }
 
+    fun estimateVideoRequiredMbps(
+        sizeBytes: Long,
+        category: SearchCategory = SearchCategory.Movies,
+    ): Double? = computeBitrateMbps(
+        adjustedBytes = sizeBytes.toDouble(),
+        category = category,
+        expectedDurationMinutes = null,
+        hasRequestedEpisode = false,
+    )
+
     private fun estimateBitrateMbps(
         result: TorrentSearchResult,
         context: PlayabilityContext,
@@ -323,11 +356,26 @@ object PlayabilityScorer {
         } else {
             rawBytes.toDouble()
         }
-        val durationMin = context.expectedDurationMinutes
+        return computeBitrateMbps(
+            adjustedBytes = adjustedBytes,
+            category = result.category,
+            expectedDurationMinutes = context.expectedDurationMinutes,
+            hasRequestedEpisode = context.requestedEpisode != null,
+        )
+    }
+
+    private fun computeBitrateMbps(
+        adjustedBytes: Double,
+        category: SearchCategory,
+        expectedDurationMinutes: Int?,
+        hasRequestedEpisode: Boolean,
+    ): Double? {
+        if (adjustedBytes <= 0.0) return null
+        val durationMin = expectedDurationMinutes
             ?: when {
-                context.requestedEpisode != null -> 45
-                result.category == SearchCategory.Anime -> 24
-                result.category == SearchCategory.Series -> 45
+                hasRequestedEpisode -> 45
+                category == SearchCategory.Anime -> 24
+                category == SearchCategory.Series -> 45
                 else -> 110
             }
         val durationSec = (durationMin * 60.0).coerceAtLeast(60.0)

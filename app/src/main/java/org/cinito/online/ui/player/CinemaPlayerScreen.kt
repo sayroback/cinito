@@ -15,6 +15,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -24,18 +25,23 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -87,7 +93,9 @@ import org.cinito.online.player.PlayerAspectMode
 import org.cinito.online.settings.SubtitleEdgeStyle
 import org.cinito.online.settings.SubtitleStyleConfig
 import org.cinito.online.ui.theme.CinemaColors
+import org.cinito.online.ui.theme.tabular
 import webtor.app.DownloadEntry
+import webtor.app.formatSpeed
 import webtor.app.liveDownloadSpeed
 import webtor.app.liveStatus
 import webtor.app.playbackTime
@@ -608,14 +616,72 @@ fun CinemaPlayerScreen(
                     ),
             )
 
-            // Informative P2P buffering overlay when stalled / starting without overlapping controls
+            // Informative P2P buffering overlay when stalled / starting
             val dlSpeed = activeEntry?.liveDownloadSpeed() ?: 0L
             val numPeers = activeEntry?.liveStatus()?.numPeers ?: 0
+            val isStalled = state.isBuffering && dlSpeed == 0L && state.errorMessage == null
+            var stalledSeconds by remember { mutableIntStateOf(0) }
+            LaunchedEffect(isStalled, state.mediaUri) {
+                if (!isStalled) {
+                    stalledSeconds = 0
+                    return@LaunchedEffect
+                }
+                stalledSeconds = 0
+                while (true) {
+                    delay(1_000L)
+                    stalledSeconds++
+                }
+            }
             val p2pBufferingStatus = if (state.isBuffering && state.errorMessage == null && !isScrubbing) {
-                CinemaPlayerUiLogic.describeP2pBufferingStatus(dlSpeed, numPeers)
+                val base = CinemaPlayerUiLogic.describeP2pBufferingStatus(dlSpeed, numPeers)
+                if (stalledSeconds >= 15) {
+                    base.copy(headline = "Sin velocidad de descarga (${stalledSeconds}s)")
+                } else {
+                    base
+                }
             } else null
-            if (p2pBufferingStatus != null && (!controlsVisible || state.isLocked)) {
-                PlayerBufferingOverlay(status = p2pBufferingStatus)
+            if (p2pBufferingStatus != null) {
+                if (stalledSeconds >= 15) {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = Color(0xC80B0D12),
+                        border = BorderStroke(1.dp, CinemaColors.HairlineBorder),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                CircularProgressIndicator(
+                                    color = CinemaColors.Primary,
+                                    strokeWidth = 2.5.dp,
+                                    modifier = Modifier.size(24.dp),
+                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        text = p2pBufferingStatus.headline,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = CinemaColors.TextPrimary,
+                                    )
+                                    Text(
+                                        text = p2pBufferingStatus.detail,
+                                        style = MaterialTheme.typography.bodySmall.tabular(),
+                                        color = CinemaColors.Secondary,
+                                    )
+                                }
+                            }
+                            OutlinedButton(onClick = onBack) {
+                                Text("Cambiar fuente / Salir")
+                            }
+                        }
+                    }
+                } else {
+                    PlayerBufferingOverlay(status = p2pBufferingStatus)
+                }
             }
 
             PlayerGestureHud(
@@ -676,11 +742,17 @@ fun CinemaPlayerScreen(
                         .background(Color(0x5A000000)),
                 ) {
                     val canSaveDirectPlay = activeEntry != null && activeEntry.directPlay && onSaveDirectPlay != null
+                    val p2pTelemetryLabel = if (activeEntry != null && !activeEntry.complete) {
+                        "↓ ${formatSpeed(dlSpeed)} · $numPeers fuentes"
+                    } else {
+                        null
+                    }
                     PlayerTopBar(
                         formattedTitle = formattedTitle,
                         castConnected = castState.isConnected,
                         isLandscape = isLandscape,
                         isSavedInLibrary = activeEntry != null && !activeEntry.directPlay,
+                        p2pTelemetryLabel = p2pTelemetryLabel,
                         onSaveToLibrary = if (canSaveDirectPlay) {
                             {
                                 interactTick++

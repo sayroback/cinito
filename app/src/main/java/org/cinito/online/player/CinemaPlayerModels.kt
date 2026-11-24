@@ -320,9 +320,9 @@ object CinemaPlayerUiLogic {
             )
         } else {
             val detail = buildList {
-                if (downloadSpeedBytesPerSec > 0L) add("↓ ${formatSpeed(downloadSpeedBytesPerSec)}")
+                add("↓ ${formatSpeed(downloadSpeedBytesPerSec)}")
                 if (numPeers > 0) add("$numPeers peers")
-            }.joinToString(" · ").ifEmpty { "Preparando flujo…" }
+            }.joinToString(" · ")
             P2pBufferingStatus(
                 headline = "Cargando búfer de video…",
                 detail = detail,

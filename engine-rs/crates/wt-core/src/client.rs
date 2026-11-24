@@ -374,9 +374,12 @@ impl ClientInner {
                     }
                     let cl = accept_client.clone();
                     accept_client.tokio_handle.spawn(async move {
-                        let _ = cl.attach_accepted(accepted).await;
+                        if let Err(e) = cl.attach_accepted(accepted).await {
+                            log::debug!(target: "webtor-engine", "attach_accepted failed: {e}");
+                        }
                     });
                 }
+                log::debug!(target: "webtor-engine", "accept loop exit");
                 accept_client
                     .accept_tx_closed
                     .store(true, Ordering::Relaxed);
@@ -453,7 +456,9 @@ impl ClientInner {
         }
         if let Some(sources) = self.sources.read().clone() {
             let _entered = self.tokio_handle.enter();
-            let _ = sources.add_trackers(&Self::torrent_keys_for(torrent), tiers);
+            if let Err(e) = sources.add_trackers(&Self::torrent_keys_for(torrent), tiers) {
+                log::warn!(target: "webtor-engine", "add_trackers hash={} failed: {e}", &torrent.info_hash.to_hex()[..8]);
+            }
         }
     }
 
@@ -704,7 +709,9 @@ impl ClientInner {
         if let Some(sources) = self.sources.read().clone() {
             let _entered = self.tokio_handle.enter();
             let keys = Self::torrent_keys_for(torrent);
-            let _ = sources.add_trackers(&keys, spec.trackers.clone());
+            if let Err(e) = sources.add_trackers(&keys, spec.trackers.clone()) {
+                log::warn!(target: "webtor-engine", "add_trackers hash={} failed: {e}", &torrent.info_hash.to_hex()[..8]);
+            }
             if !spec.web_seeds.is_empty() {
                 // Sink path also used at register; merge into torrent above is enough for now.
             }
@@ -813,7 +820,10 @@ impl ClientInner {
                 scope
                     .spawn(|| self.tokio_handle.block_on(fut))
                     .join()
-                    .expect("client runtime operation panicked")
+                    .unwrap_or_else(|payload| {
+                        log::error!(target: "webtor-engine", "client runtime operation panicked; resuming unwind");
+                        std::panic::resume_unwind(payload)
+                    })
             })
         } else {
             self.tokio_handle.block_on(fut)
@@ -889,14 +899,22 @@ impl ClientInner {
                     let hashes = client.lsd_info_hashes();
                     drop(client);
                     for chunk in hashes.chunks(lsd::HASHES_PER_ANNOUNCE) {
-                        let _ = socket.send_to(lsd::announce(port, &cookie, chunk).as_bytes(), group).await;
+                        if let Err(e) = socket.send_to(lsd::announce(port, &cookie, chunk).as_bytes(), group).await {
+                            log::debug!(target: "webtor-engine", "lsd announce send failed: {e}");
+                        }
                     }
                     last = Some(tokio::time::Instant::now());
                     next = tokio::time::Instant::now() + lsd::ANNOUNCE_EVERY;
                 }
                 tokio::select! {
                     received = socket.recv_from(&mut buf) => {
-                        let Ok((n, from)) = received else { continue };
+                        let (n, from) = match received {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::debug!(target: "webtor-engine", "lsd recv failed: {e}");
+                                continue;
+                            }
+                        };
                         let Some(announce) = lsd::parse(&buf[..n]) else { continue };
                         if announce.cookie.as_deref() == Some(cookie.as_str()) {
                             continue;
@@ -957,16 +975,24 @@ impl ClientInner {
             listener.close();
         }
 
-        for task in self.tasks.lock().drain(..) {
-            task.abort();
+        {
+            let mut tasks = self.tasks.lock();
+            log::debug!(target: "webtor-engine", "client close tasks={}", tasks.len());
+            for task in tasks.drain(..) {
+                task.abort();
+            }
         }
         // Go `clearPortMappings`; a router that stopped answering must not
         // hold up shutdown.
         let mappings = std::mem::take(&mut *self.port_mappings.lock());
         if !mappings.is_empty() {
+            let count = mappings.len();
             self.block_on(async move {
-                let _ = tokio::time::timeout(Duration::from_millis(1500),
-                    wt_discovery::portfwd::unmap(&mappings)).await;
+                if tokio::time::timeout(Duration::from_millis(1500),
+                    wt_discovery::portfwd::unmap(&mappings)).await.is_err()
+                {
+                    log::warn!(target: "webtor-engine", "port unmap timed out after 1500ms n={count}");
+                }
             });
         }
 
@@ -991,16 +1017,22 @@ impl ClientInner {
     }
 
     fn start_dialer(self: &Arc<Self>, torrent: &Arc<TorrentInner>) {
+        let hash8 = torrent.info_hash.to_hex()[..8].to_string();
+        log::debug!(target: "webtor-engine", "dialer spawn hash={hash8}");
         let client = Arc::downgrade(self);
         let torrent = Arc::downgrade(torrent);
         let task = self.tokio_handle.spawn(async move {
             let mut last_announce_refresh = Instant::now() - Duration::from_secs(60);
-            loop {
+            let mut last_dial_state = String::new();
+            // Idle wake-ups (no dial candidates) are counted and logged at most every 5s.
+            let mut idle_ticks: u64 = 0;
+            let mut last_idle_log = Instant::now();
+            let exit_reason: &str = loop {
                 let (Some(client), Some(torrent)) = (client.upgrade(), torrent.upgrade()) else {
-                    break;
+                    break "owner dropped";
                 };
                 if client.closed.load(Ordering::Relaxed) || torrent.closed.load(Ordering::Relaxed) {
-                    break;
+                    break "closed";
                 }
                 torrent.end_peer_burst_if_due();
                 if torrent.bursting() {
@@ -1012,6 +1044,16 @@ impl ClientInner {
                         .saturating_sub(torrent.dialing_peers.lock().len())
                         .min(total.saturating_sub(client.half_open.current_total()))
                 } else { 0 };
+                let dial_state = format!(
+                    "wants={} known={} mayDial={}",
+                    torrent.wants_conns() > 0,
+                    torrent.known_peers.read().len(),
+                    count > 0,
+                );
+                if dial_state != last_dial_state {
+                    log::info!(target: "webtor-engine", "dialer hash={} {dial_state}", &torrent.info_hash.to_hex()[..8]);
+                    last_dial_state = dial_state;
+                }
                 // Refresh want_peers snapshot every 5s while under low-water so
                 // tracker slots can be nudged (see AnnounceDispatcher::update_torrent).
                 if torrent.known_peers.read().len() <= client.config.torrent_peers_low_water
@@ -1022,10 +1064,38 @@ impl ClientInner {
                         sources.refresh_torrent(&ClientInner::torrent_keys_for(&torrent));
                     }
                 }
-                for peer in torrent.take_dial_candidates(count) {
+                let candidates = torrent.take_dial_candidates(count);
+                if candidates.is_empty() {
+                    idle_ticks += 1;
+                    if last_idle_log.elapsed() >= Duration::from_secs(5) {
+                        let reason = if torrent.wants_conns() == 0 {
+                            "not_wanted"
+                        } else if count == 0 {
+                            "no_slots"
+                        } else {
+                            "no_candidates"
+                        };
+                        log::debug!(target: "webtor-engine",
+                            "dialer idle hash={hash8} reason={reason} slots={count} ticks={idle_ticks}");
+                        idle_ticks = 0;
+                        last_idle_log = Instant::now();
+                    }
+                }
+                let (slot_per, slot_total) = client.half_open_limits_for(&torrent);
+                for peer in candidates {
                     if peer.source == PeerSource::Pex {
                         torrent.swarm_diagnostics.lock().pex_dialed += 1;
                     }
+                    log::debug!(
+                        target: "webtor-engine",
+                        "dial start hash={hash8} addr={} src={:?} torrent_inflight={}/{} total_inflight={}/{}",
+                        peer.addr,
+                        peer.source,
+                        client.half_open.current_for_torrent(&torrent.info_hash),
+                        slot_per,
+                        client.half_open.current_total(),
+                        slot_total,
+                    );
                     let cl = Arc::clone(&client);
                     let tor = Arc::clone(&torrent);
                     let task = client.tokio_handle.spawn(async move {
@@ -1034,6 +1104,9 @@ impl ClientInner {
                             result = cl.dial_peer(Arc::clone(&tor), peer.addr, peer.source) => result,
                             _ = route.changed() => {
                                 // Not this peer's fault: back in the pool, no penalty.
+                                log::debug!(target: "webtor-engine",
+                                    "dial cancelled hash={} addr={} src={:?} reason=route_changed",
+                                    &tor.info_hash.to_hex()[..8], peer.addr, peer.source);
                                 tor.add_peers(vec![peer.clone()]);
                                 tor.dial_finished(peer.addr, true);
                                 return;
@@ -1044,6 +1117,14 @@ impl ClientInner {
                         // half-open slot, no room, already connected) must
                         // not cost it a fail count: see `DialVerdict`.
                         let verdict = crate::torrent::dial_verdict(&result);
+                        log::info!(
+                            target: "webtor-engine",
+                            "dial result hash={} addr={} src={:?} verdict={verdict:?} err={:?}",
+                            &tor.info_hash.to_hex()[..8],
+                            peer.addr,
+                            peer.source,
+                            result.as_ref().err().map(|e| e.to_string()),
+                        );
                         if !matches!(
                             verdict,
                             crate::torrent::DialVerdict::Connected | crate::torrent::DialVerdict::Unreachable
@@ -1137,7 +1218,8 @@ impl ClientInner {
                     _ = torrent.peers_changed().notified() => {},
                     _ = tokio::time::sleep(Duration::from_millis(if dialing { 100 } else { 1000 })) => {},
                 }
-            }
+            };
+            log::debug!(target: "webtor-engine", "dialer exit hash={hash8} reason={exit_reason}");
         });
         self.tasks.lock().push(task);
     }

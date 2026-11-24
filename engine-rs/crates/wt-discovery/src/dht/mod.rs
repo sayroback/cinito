@@ -162,14 +162,29 @@ impl DhtNode {
                 }
             }
             let lookups = hosts.into_iter().map(|host| async move {
-                match tokio::time::timeout(BOOTSTRAP_DNS_TIMEOUT, tokio::net::lookup_host(host)).await {
-                    Ok(Ok(found)) => found.filter(SocketAddr::is_ipv4).map(|a| a.to_string()).collect(),
-                    _ => Vec::new(),
+                let started = std::time::Instant::now();
+                let res = tokio::time::timeout(BOOTSTRAP_DNS_TIMEOUT, tokio::net::lookup_host(host.clone())).await;
+                let ms = started.elapsed().as_millis();
+                match res {
+                    Ok(Ok(found)) => {
+                        let v: Vec<String> = found.filter(SocketAddr::is_ipv4).map(|a| a.to_string()).collect();
+                        log::debug!(target: "webtor-engine", "dht bootstrap dns host={host} ok v4={} ms={ms}", v.len());
+                        v
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!(target: "webtor-engine", "dht bootstrap dns host={host} err={e:?} ms={ms}");
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        log::warn!(target: "webtor-engine", "dht bootstrap dns host={host} timeout ms={ms}");
+                        Vec::new()
+                    }
                 }
             });
             for found in futures::future::join_all(lookups).await {
                 addrs.extend(found);
             }
+            log::info!(target: "webtor-engine", "dht bootstrap addrs={} (ip literals)", addrs.len());
             addrs.extend(pending_t.lock().take().unwrap_or_default());
             if closed_t.load(Ordering::SeqCst) {
                 let _ = ready_tx.send(true);
@@ -199,16 +214,32 @@ impl DhtNode {
                         *inner_t.lock() = Some(dht.clone());
                     }
                     let _ = ready_tx.send(true);
+                    // Progress per tick (debug): routing-table size while bootstrapping.
+                    let ticker = dht.clone();
+                    let closed_tick = Arc::clone(&closed_t);
+                    tokio::spawn(async move {
+                        for tick in 1..=30u32 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            if closed_tick.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let nodes = ticker.info().await.dht_size_estimate().0;
+                            log::debug!(target: "webtor-engine", "dht bootstrap tick={tick} nodes={nodes}");
+                        }
+                    });
                     // Warm the routing table (Go `Bootstrap` goroutine).
-                    let _ = tokio::time::timeout(Duration::from_secs(5), dht.bootstrapped()).await;
+                    let warm = tokio::time::timeout(Duration::from_secs(5), dht.bootstrapped()).await;
+                    log::info!(target: "webtor-engine", "dht ready bootstrapped={} local={:?}", warm.is_ok(), info.local_addr());
                 }
                 Ok(Err(e)) => {
                     // Like Go, a DHT failure is not fatal: trackers keep working.
                     tracing::warn!("dht disabled: {e}");
+                    log::warn!(target: "webtor-engine", "dht disabled: {e}");
                     let _ = ready_tx.send(true);
                 }
                 Err(e) => {
                     tracing::warn!("dht start failed: {e}");
+                    log::warn!(target: "webtor-engine", "dht start failed (task): {e:?}");
                     let _ = ready_tx.send(true);
                 }
             }
@@ -232,7 +263,11 @@ impl DhtNode {
             return Some(dht);
         }
         let mut ready = self.ready.clone();
-        let _ = tokio::time::timeout(READY_WAIT, ready.wait_for(|started| *started)).await;
+        match tokio::time::timeout(READY_WAIT, ready.wait_for(|started| *started)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => log::warn!(target: "webtor-engine", "dht start watch closed: {e:?}"),
+            Err(_) => log::warn!(target: "webtor-engine", "dht still starting after {}s", READY_WAIT.as_secs()),
+        }
         self.inner.lock().clone()
     }
 
@@ -282,7 +317,13 @@ impl DhtNode {
         let boot = dht.to_bootstrap().await;
         boot.into_iter()
             .filter_map(|s| {
-                let addr: SocketAddr = s.parse().ok()?;
+                let addr: SocketAddr = match s.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::debug!(target: "webtor-engine", "dht export skipped bootstrap entry={s:?} err={e}");
+                        return None;
+                    }
+                };
                 Some(Contact {
                     id: [0u8; 20], // mainline bootstrap strings are addr-only
                     addr,
@@ -300,6 +341,8 @@ impl DhtNode {
             // Still starting: these join the bootstrap list.
             if let Some(pending) = self.pending.lock().as_mut() {
                 pending.extend(contacts.iter().map(Contact::to_bootstrap_string));
+            } else {
+                log::warn!(target: "webtor-engine", "dht contacts dropped (node starting) count={}", contacts.len());
             }
             return;
         };
@@ -307,11 +350,20 @@ impl DhtNode {
             if let SocketAddr::V4(_a) = c.addr {
                 let info = dht.info().await;
                 let id = if c.id != [0u8; 20] {
-                    mainline::Id::from_bytes(c.id).unwrap_or_else(|_| *info.id())
+                    match mainline::Id::from_bytes(c.id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log::debug!(target: "webtor-engine", "dht contact id invalid addr={} err={e:?}; using own id", c.addr);
+                            *info.id()
+                        }
+                    }
                 } else {
                     *info.id()
                 };
-                let _ = dht.find_node(id).await;
+                let found = dht.find_node(id).await;
+                log::debug!(target: "webtor-engine", "dht import contact addr={} nodes={}", c.addr, found.len());
+            } else {
+                log::debug!(target: "webtor-engine", "dht import contact skipped (not ipv4) addr={}", c.addr);
             }
         }
     }
@@ -327,11 +379,18 @@ impl DhtNode {
         port: u16,
         implied_port: bool,
     ) -> Result<AnnounceHandle> {
+        let hash8 = info_hash.to_hex()[..8].to_string();
         let Some(dht) = self.running().await else {
+            log::warn!(target: "webtor-engine", "dht lookup not started hash={hash8} reason=node not running");
             return Err(DhtError::Other("dht closed".into()));
         };
-        let id =
-            mainline::Id::from_bytes(info_hash.0).map_err(|e| DhtError::Other(e.to_string()))?;
+        let id = match mainline::Id::from_bytes(info_hash.0) {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!(target: "webtor-engine", "dht lookup id invalid hash={hash8} err={e:?}");
+                return Err(DhtError::Other(e.to_string()));
+            }
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -339,10 +398,15 @@ impl DhtNode {
         let announce_port = if implied_port { None } else { Some(port) };
 
         tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let start_size = dht.info().await.dht_size_estimate().0;
+            log::info!(target: "webtor-engine", "dht lookup start hash={hash8} routingSize={start_size}");
             let mut stream = dht.get_peers(id);
+            let mut dht_peers_total = 0usize;
+            let mut end_reason = "stream_end";
             loop {
                 tokio::select! {
-                    _ = &mut cancel_rx => break,
+                    _ = &mut cancel_rx => { end_reason = "cancelled"; break }
                     next = futures::StreamExt::next(&mut stream) => {
                         match next {
                             Some(peers) => {
@@ -350,7 +414,10 @@ impl DhtNode {
                                     .into_iter()
                                     .map(SocketAddr::V4)
                                     .collect();
+                                dht_peers_total += addrs.len();
+                                log::debug!(target: "webtor-engine", "dht lookup batch hash={hash8} peers={}", addrs.len());
                                 if tx.send(PeersValues { peers: addrs, from: None }).await.is_err() {
+                                    end_reason = "consumer_dropped";
                                     break;
                                 }
                             }
@@ -359,8 +426,17 @@ impl DhtNode {
                     }
                 }
             }
+            let dht_size = dht.info().await.dht_size_estimate().0;
+            let duration_ms = started.elapsed().as_millis();
+            log::info!(
+                target: "webtor-engine",
+                "dht lookup hash={hash8} peers={dht_peers_total} routingSize={dht_size} duration_ms={duration_ms} end={end_reason}"
+            );
             // After lookup, announce ourselves.
-            let _ = dht.announce_peer(id, announce_port).await;
+            match dht.announce_peer(id, announce_port).await {
+                Ok(_) => log::debug!(target: "webtor-engine", "dht announce_peer ok hash={hash8}"),
+                Err(e) => log::warn!(target: "webtor-engine", "dht announce_peer failed hash={hash8} err={e:?}"),
+            }
         });
 
         Ok(AnnounceHandle {

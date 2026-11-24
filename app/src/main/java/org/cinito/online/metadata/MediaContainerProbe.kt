@@ -167,6 +167,9 @@ data class ContainerProbeResult(
 
 interface ProbeByteSource : Closeable {
     val length: Long
+
+    /** False for live torrent streams: never seek across undownloaded gigabytes to find a tail header. */
+    val allowFarSeek: Boolean get() = true
     fun readAt(offset: Long, buffer: ByteArray, size: Int = buffer.size): Int
 }
 
@@ -175,6 +178,7 @@ class EnginePreviewByteSource(
     engineId: String,
     fileIndex: Int,
     override val length: Long,
+    override val allowFarSeek: Boolean = false,
 ) : ProbeByteSource {
     private val handle: Long = engine.openPreview(engineId, fileIndex)
 
@@ -283,7 +287,9 @@ object MediaContainerProbe {
                             }
                         }
                     }
-                    if (tracksSeekAbsOffset != null && tracksSeekAbsOffset + 8L < source.length) {
+                    if (tracksSeekAbsOffset != null && tracksSeekAbsOffset + 8L < source.length &&
+                        (source.allowFarSeek || tracksSeekAbsOffset <= MAX_HEADER_PROBE_BYTES)
+                    ) {
                         val remoteTracks = readMatroskaTracksAt(source, tracksSeekAbsOffset)
                         if (!remoteTracks.isNullOrEmpty()) {
                             return ContainerProbeResult("MKV", remoteTracks)
@@ -297,7 +303,7 @@ object MediaContainerProbe {
 
         val finalBuf = buf ?: return null
         tracksSeekAbsOffset?.let { absOff ->
-            if (absOff + 8L < source.length) {
+            if (absOff + 8L < source.length && (source.allowFarSeek || absOff <= MAX_HEADER_PROBE_BYTES)) {
                 readMatroskaTracksAt(source, absOff)?.takeIf { it.isNotEmpty() }?.let {
                     return ContainerProbeResult("MKV", it)
                 }
@@ -592,8 +598,17 @@ object MediaContainerProbe {
                 break
             }
             offset += size
+            if (moovOffset < 0L && !source.allowFarSeek && offset > MAX_HEADER_PROBE_BYTES &&
+                (firstMdatOffset >= 0L || type == "ftyp")
+            ) {
+                // moov sits after mdat in a live stream: reading it would stall on the file tail.
+                return ContainerProbeResult("MP4", emptyList(), isFastStartMp4 = false)
+            }
         }
 
+        if (moovOffset < 0L && firstMdatOffset >= 0L && !source.allowFarSeek) {
+            return ContainerProbeResult("MP4", emptyList(), isFastStartMp4 = false)
+        }
         if (moovOffset < 0L || moovSize <= 0L) return null
         val tracks = mutableListOf<ProbedTrack>()
         if (moovSize <= MAX_CONTIGUOUS_MOOV_BYTES) {

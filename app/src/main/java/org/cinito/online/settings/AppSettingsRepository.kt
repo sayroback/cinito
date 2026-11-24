@@ -51,6 +51,10 @@ data class AppPreferences(
     val useExternalPlayer: Boolean = false,
     val libraryViewMode: LibraryViewMode = LibraryViewMode.Gallery,
     val showRawFilenames: Boolean = false,
+    val broadGeneralSearchEnabled: Boolean = false,
+    val hideAdultContent: Boolean = true,
+    val adultOnlySearch: Boolean = false,
+    val disabledAdultProviderIds: Set<String> = emptySet(),
     val allowMobileData: Boolean = false,
     val hasTmdbApiKey: Boolean = false,
     val recentSearchQueries: List<String> = emptyList(),
@@ -66,11 +70,17 @@ data class AppPreferences(
             "yts",
             "nyaa",
             "torrentscsv",
+            "sukebei",
+            "therarbg",
         )
         internal val V2_NEW_DEFAULT_PROVIDERS: Set<String> = setOf(
             "torrentio",
             "solidtorrents",
             "limetorrents",
+        )
+        internal val V3_NEW_DEFAULT_PROVIDERS: Set<String> = setOf(
+            "sukebei",
+            "therarbg",
         )
     }
 }
@@ -198,6 +208,42 @@ class AppSettingsRepository(
         _preferences.update { it.copy(showRawFilenames = show) }
     }
 
+    fun setBroadGeneralSearchEnabled(enabled: Boolean) {
+        storage.putBoolean(KEY_BROAD_GENERAL_SEARCH, enabled)
+        _preferences.update { it.copy(broadGeneralSearchEnabled = enabled) }
+    }
+
+    fun setHideAdultContent(hide: Boolean) {
+        storage.putBoolean(KEY_HIDE_ADULT_CONTENT, hide)
+        if (hide) {
+            storage.putBoolean(KEY_ADULT_ONLY_SEARCH, false)
+        }
+        _preferences.update {
+            it.copy(
+                hideAdultContent = hide,
+                adultOnlySearch = if (hide) false else it.adultOnlySearch,
+            )
+        }
+    }
+
+    fun setAdultOnlySearch(enabled: Boolean) {
+        val effective = enabled && !_preferences.value.hideAdultContent
+        storage.putBoolean(KEY_ADULT_ONLY_SEARCH, effective)
+        _preferences.update { it.copy(adultOnlySearch = effective) }
+    }
+
+    fun setAdultProviderEnabled(providerId: String, enabled: Boolean) {
+        _preferences.update { current ->
+            val next = if (enabled) {
+                current.disabledAdultProviderIds - providerId
+            } else {
+                current.disabledAdultProviderIds + providerId
+            }
+            storage.putStringSet(KEY_DISABLED_ADULT_PROVIDERS, next)
+            current.copy(disabledAdultProviderIds = next)
+        }
+    }
+
     fun setAllowMobileData(allow: Boolean) {
         storage.putBoolean(KEY_ALLOW_MOBILE_DATA, allow)
         _preferences.update { it.copy(allowMobileData = allow) }
@@ -244,13 +290,16 @@ class AppSettingsRepository(
         val savedProviders = storage.getStringSet(KEY_ENABLED_PROVIDERS, AppPreferences.DEFAULT_PROVIDER_IDS)
         val seedVersion = storage.getFloat(KEY_PROVIDER_SEED_VERSION, 1f).toInt()
         val migratedProviders = if (seedVersion < CURRENT_PROVIDER_SEED_VERSION) {
-            val merged = savedProviders + AppPreferences.V2_NEW_DEFAULT_PROVIDERS
+            var merged = savedProviders
+            if (seedVersion < 2) merged = merged + AppPreferences.V2_NEW_DEFAULT_PROVIDERS
+            if (seedVersion < 3) merged = merged + AppPreferences.V3_NEW_DEFAULT_PROVIDERS
             storage.putStringSet(KEY_ENABLED_PROVIDERS, merged)
             storage.putFloat(KEY_PROVIDER_SEED_VERSION, CURRENT_PROVIDER_SEED_VERSION.toFloat())
             merged
         } else {
             savedProviders
         }
+        val hideAdult = storage.getBoolean(KEY_HIDE_ADULT_CONTENT, true)
         return AppPreferences(
             dohProvider = doh,
             metadataLookupEnabled = storage.getBoolean(KEY_METADATA_LOOKUP, true),
@@ -270,6 +319,10 @@ class AppSettingsRepository(
             useExternalPlayer = storage.getBoolean(KEY_EXTERNAL_PLAYER, false),
             libraryViewMode = viewMode,
             showRawFilenames = storage.getBoolean(KEY_RAW_FILENAMES, false),
+            broadGeneralSearchEnabled = storage.getBoolean(KEY_BROAD_GENERAL_SEARCH, false),
+            hideAdultContent = hideAdult,
+            adultOnlySearch = !hideAdult && storage.getBoolean(KEY_ADULT_ONLY_SEARCH, false),
+            disabledAdultProviderIds = storage.getStringSet(KEY_DISABLED_ADULT_PROVIDERS, emptySet()),
             allowMobileData = storage.getBoolean(KEY_ALLOW_MOBILE_DATA, false),
             hasTmdbApiKey = !getTmdbApiKey().isNullOrBlank(),
             recentSearchQueries = storage.getString(KEY_RECENT_SEARCHES, null)
@@ -291,7 +344,7 @@ class AppSettingsRepository(
         private const val KEY_TMDB_API_KEY = "tmdb_api_key_v1"
         private const val KEY_ENABLED_PROVIDERS = "enabled_provider_ids"
         private const val KEY_PROVIDER_SEED_VERSION = "provider_seed_version"
-        private const val CURRENT_PROVIDER_SEED_VERSION = 2
+        private const val CURRENT_PROVIDER_SEED_VERSION = 3
         private const val KEY_AUDIO_LANG = "preferred_audio_lang"
         private const val KEY_SUB_LANG = "preferred_sub_lang"
         private const val KEY_SUBS_ENABLED = "subs_enabled_default"
@@ -302,6 +355,10 @@ class AppSettingsRepository(
         private const val KEY_EXTERNAL_PLAYER = "use_external_player"
         private const val KEY_LIBRARY_MODE = "library_view_mode"
         private const val KEY_RAW_FILENAMES = "show_raw_filenames"
+        private const val KEY_BROAD_GENERAL_SEARCH = "broad_general_search_enabled"
+        private const val KEY_HIDE_ADULT_CONTENT = "hide_adult_content"
+        private const val KEY_ADULT_ONLY_SEARCH = "adult_only_search"
+        private const val KEY_DISABLED_ADULT_PROVIDERS = "disabled_adult_provider_ids"
         private const val KEY_ALLOW_MOBILE_DATA = "allow_mobile_data"
         private const val KEY_RECENT_SEARCHES = "recent_search_queries_v1"
         private const val MAX_RECENT_SEARCHES = 10

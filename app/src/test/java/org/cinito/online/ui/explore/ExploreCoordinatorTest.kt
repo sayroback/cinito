@@ -16,6 +16,9 @@ import org.cinito.online.metadata.MediaMetadata
 import org.cinito.online.metadata.MetadataRepository
 import org.cinito.online.network.DohProvider
 import org.cinito.online.network.HardenedNetworkClient
+import org.cinito.online.search.PlayabilityAssessment
+import org.cinito.online.search.PlayabilityScorer
+import org.cinito.online.search.PlayabilityVerdict
 import org.cinito.online.search.SearchCategory
 import org.cinito.online.search.SearchLanguageFilter
 import org.cinito.online.search.SearchProviderInfo
@@ -857,6 +860,426 @@ class ExploreCoordinatorTest {
             }
             assertEquals(1, addCalls)
             assertEquals(5, autoProbed.probeResultsByHash[h1]?.connectedSeeders)
+        } finally {
+            coordScope.cancel()
+            cacheDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun reEnablingHideAdultContentResetsAdultCategoryAndFiltersAdultResults() = runBlocking {
+        val cacheDir = Files.createTempDirectory("explore-hide-adult-test").toFile()
+        val coordScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val repo = MetadataRepository(
+                network = HardenedNetworkClient(DohProvider.System),
+                cacheDir = cacheDir,
+            )
+            val adultProvider = RecordingProvider(
+                info = SearchProviderInfo(
+                    id = "piratebay",
+                    name = "TPB",
+                    url = "https://tpb.invalid",
+                    categories = setOf(SearchCategory.All, SearchCategory.Adult),
+                    supportsAdultContent = true,
+                    hasStrictAdultCategory = true,
+                ),
+                onSearch = { _, _ ->
+                    listOf(
+                        SearchUtils.makeResult(
+                            providerId = "piratebay",
+                            providerName = "TPB",
+                            title = "Adult XXX Pack",
+                            magnetUri = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            seeders = 10,
+                            category = SearchCategory.Adult,
+                        ),
+                        SearchUtils.makeResult(
+                            providerId = "piratebay",
+                            providerName = "TPB",
+                            title = "Clean Documentary 1080p",
+                            magnetUri = "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            seeders = 15,
+                            category = SearchCategory.Movies,
+                        ),
+                    )
+                },
+            )
+            val prefsFlow = MutableStateFlow(
+                AppPreferences(
+                    enabledProviderIds = setOf("piratebay"),
+                    hideAdultContent = false,
+                ),
+            )
+            val coordinator = ExploreCoordinator(
+                scope = coordScope,
+                metadataRepository = repo,
+                searchService = SearchService(listOf(adultProvider)),
+                preferencesFlow = prefsFlow,
+                torznabFlow = MutableStateFlow(emptyList()),
+                onRecordRecentSearch = {},
+            )
+
+            coordinator.setSearchCategory(SearchCategory.Adult)
+            coordinator.submitSearch("sample")
+            val loaded = awaitState(coordinator.search) { !it.isSearching && it.rawResults.isNotEmpty() }
+            assertEquals(SearchCategory.Adult, loaded.category)
+
+            prefsFlow.value = prefsFlow.value.copy(hideAdultContent = true)
+            val afterHide = awaitState(coordinator.search) {
+                it.category == SearchCategory.All &&
+                    it.rawResults.none { r -> r.category == SearchCategory.Adult || SearchUtils.isAdultContent(r.title, r.description) }
+            }
+            assertEquals(SearchCategory.All, afterHide.category)
+        } finally {
+            coordScope.cancel()
+            cacheDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun adultOnlySearchDoesNotOverrideExplicitCategoriesAndSkipsRecentHistory() = runBlocking {
+        val cacheDir = Files.createTempDirectory("explore-adult-only-test").toFile()
+        val coordScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val recordedRecent = mutableListOf<String>()
+        val capturedCategories = mutableListOf<SearchCategory>()
+        try {
+            val repo = MetadataRepository(
+                network = HardenedNetworkClient(DohProvider.System),
+                cacheDir = cacheDir,
+            )
+            val generalProvider = RecordingProvider(
+                info = SearchProviderInfo(
+                    id = "knaben",
+                    name = "Knaben",
+                    url = "https://k.invalid",
+                    categories = setOf(SearchCategory.All, SearchCategory.Movies, SearchCategory.Series),
+                ),
+                onSearch = { _, cat ->
+                    capturedCategories += cat
+                    listOf(
+                        SearchUtils.makeResult(
+                            providerId = "knaben",
+                            providerName = "Knaben",
+                            title = "Inception 2010 1080p",
+                            magnetUri = "magnet:?xt=urn:btih:cccccccccccccccccccccccccccccccccccccccc",
+                            seeders = 40,
+                            category = SearchCategory.Movies,
+                        ),
+                    )
+                },
+            )
+            val prefsFlow = MutableStateFlow(
+                AppPreferences(
+                    enabledProviderIds = setOf("knaben"),
+                    hideAdultContent = false,
+                    adultOnlySearch = true,
+                ),
+            )
+            val coordinator = ExploreCoordinator(
+                scope = coordScope,
+                metadataRepository = repo,
+                searchService = SearchService(listOf(generalProvider)),
+                preferencesFlow = prefsFlow,
+                torznabFlow = MutableStateFlow(emptyList()),
+                onRecordRecentSearch = { recordedRecent += it },
+            )
+
+            // 1. All + adultOnlySearch -> effectiveAdultOnly = true -> skips recent history
+            coordinator.submitSearch("adult query")
+            awaitState(coordinator.search) { !it.isSearching && it.submittedQuery == "adult query" }
+            assertTrue(recordedRecent.isEmpty())
+
+            // 2. Explicit Movies category -> adultOnlySearch does NOT force +18, records recent search
+            coordinator.setSearchCategory(SearchCategory.Movies)
+            coordinator.submitSearch("Inception")
+            val moviesState = awaitState(coordinator.search) {
+                !it.isSearching && it.submittedQuery == "Inception" && it.rawResults.isNotEmpty()
+            }
+            assertEquals(1, moviesState.rawResults.size)
+            assertEquals(listOf("Inception"), recordedRecent)
+            assertTrue(capturedCategories.contains(SearchCategory.Movies))
+
+            // 3. Direct Adult category with adultOnlySearch = false -> skips recent history
+            prefsFlow.value = prefsFlow.value.copy(adultOnlySearch = false)
+            coordinator.searchDirectFromDiscover("secret adult", SearchCategory.Adult)
+            awaitState(coordinator.search) { !it.isSearching && it.submittedQuery == "secret adult" }
+            assertEquals(listOf("Inception"), recordedRecent)
+        } finally {
+            coordScope.cancel()
+            cacheDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun filterSearchPlayableResultsHidesDeadWhenEnabledAndShowsAllWhenDisabled() {
+        val live = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Live Movie 1080p",
+            magnetUri = SearchUtils.buildMagnet("1111111111111111111111111111111111111111", "Live"),
+            seeders = 25,
+        )
+        val deadExplicit = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Dead Explicit 1080p",
+            magnetUri = SearchUtils.buildMagnet("2222222222222222222222222222222222222222", "Dead1"),
+            seeders = 0,
+        )
+        val deadFallback = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Dead Fallback 720p",
+            magnetUri = SearchUtils.buildMagnet("3333333333333333333333333333333333333333", "Dead2"),
+            seeders = 0,
+        )
+        val results = listOf(live, deadExplicit, deadFallback)
+        val assessments: Map<String, PlayabilityAssessment> = mapOf(
+            live.id to PlayabilityScorer.evaluate(live),
+            deadExplicit.id to PlayabilityScorer.evaluate(deadExplicit).copy(verdict = PlayabilityVerdict.Dead),
+            // deadFallback intentionally omitted to exercise PlayabilityScorer.evaluate(it) fallback
+        )
+
+        val hidden = filterSearchPlayableResults(
+            results = results,
+            assessments = assessments,
+            hideDeadResults = true,
+        )
+        assertEquals(listOf(live), hidden.visible)
+        assertEquals(2, hidden.hiddenDeadCount)
+
+        val shown = filterSearchPlayableResults(
+            results = results,
+            assessments = assessments,
+            hideDeadResults = false,
+        )
+        assertEquals(results, shown.visible)
+        assertEquals(0, shown.hiddenDeadCount)
+    }
+
+    @Test
+    fun setHideDeadSearchResultsUpdatesSearchState() = runBlocking {
+        val cacheDir = Files.createTempDirectory("explore-hide-dead-test").toFile()
+        val coordScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val coordinator = ExploreCoordinator(
+                scope = coordScope,
+                metadataRepository = MetadataRepository(
+                    network = HardenedNetworkClient(DohProvider.System),
+                    cacheDir = cacheDir,
+                ),
+                searchService = SearchService(emptyList()),
+                preferencesFlow = MutableStateFlow(AppPreferences()),
+                torznabFlow = MutableStateFlow(emptyList()),
+                onRecordRecentSearch = {},
+            )
+
+            assertTrue(coordinator.search.value.hideDeadResults)
+
+            coordinator.setHideDeadSearchResults(false)
+            assertFalse(coordinator.search.value.hideDeadResults)
+
+            coordinator.setHideDeadSearchResults(true)
+            assertTrue(coordinator.search.value.hideDeadResults)
+        } finally {
+            coordScope.cancel()
+            cacheDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun progressiveSearchScanPausesAtFiveVerifiedItemsAndResumesRemaining() = runBlocking {
+        val cacheDir = Files.createTempDirectory("explore-scan-checkpoint-test").toFile()
+        val coordScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val hashes = (1..7).map { idx -> idx.toString().repeat(40) }
+        try {
+            val repo = MetadataRepository(
+                network = HardenedNetworkClient(DohProvider.System),
+                cacheDir = cacheDir,
+            )
+            val fakeProvider = RecordingProvider(
+                info = SearchProviderInfo("knaben", "Knaben", "https://k.invalid", setOf(SearchCategory.Movies)),
+                onSearch = { _, _ ->
+                    hashes.mapIndexed { idx, hash ->
+                        SearchUtils.makeResult(
+                            providerId = "knaben",
+                            providerName = "Knaben",
+                            title = "Movie ${idx + 1} 1080p Latino",
+                            magnetUri = "magnet:?xt=urn:btih:$hash",
+                            seeders = 50 - idx,
+                        )
+                    }
+                },
+            )
+            var nextId = 0
+            val idToHash = java.util.concurrent.ConcurrentHashMap<String, String>()
+            val fakeTransport = webtor.core.EngineTransport { method, path, body ->
+                when {
+                    method == "POST" && path == "/add" -> {
+                        val hash = hashes.firstOrNull { body?.contains(it, ignoreCase = true) == true } ?: hashes[0]
+                        val id = "scan-${++nextId}"
+                        idToHash[id] = hash
+                        webtor.core.EngineResponse(200, """{"id":"$id","infoHash":"$hash"}""")
+                    }
+                    method == "GET" && path.startsWith("/torrent/") -> {
+                        val id = path.removePrefix("/torrent/")
+                        val hash = idToHash[id] ?: hashes[0]
+                        webtor.core.EngineResponse(
+                            200,
+                            """{"id":"$id","infoHash":"$hash","ready":true,"done":false,"paused":false,"progress":0.02,"downloadSpeed":2500000,"uploadSpeed":0,"numPeers":12,"connectedSeeders":4,"swarmAvailability":4.0,"length":1000000000,"downloaded":65536,"uploaded":0,"files":[{"index":0,"name":"Movie.mp4","path":"Movie.mp4","length":1000000000,"progress":0.02,"type":"video/mp4"}]}""",
+                        )
+                    }
+                    method == "POST" && path == "/focus" -> webtor.core.EngineResponse(200, """{"ok":true}""")
+                    method == "POST" && path == "/remove" -> webtor.core.EngineResponse(200, """{"ok":true}""")
+                    else -> error("Unexpected $method $path")
+                }
+            }
+            val prober = org.cinito.online.search.SwarmDiagnosticsCoordinator(
+                engineClient = webtor.core.EngineClient(fakeTransport),
+                delayFn = {},
+                postReadySampleWindowMs = 0L,
+            )
+            val coordinator = ExploreCoordinator(
+                scope = coordScope,
+                metadataRepository = repo,
+                searchService = SearchService(listOf(fakeProvider)),
+                preferencesFlow = MutableStateFlow(
+                    AppPreferences(
+                        enabledProviderIds = setOf("knaben"),
+                        playabilityDiagnosticsMode = org.cinito.online.settings.PlayabilityDiagnosticsMode.LocalOnly,
+                    ),
+                ),
+                torznabFlow = MutableStateFlow(emptyList()),
+                onRecordRecentSearch = {},
+                swarmDiagnostics = prober,
+            )
+
+            coordinator.submitSearch("Checkpoint Movie")
+            awaitState(coordinator.search) { !it.isSearching && it.rawResults.size == 7 }
+
+            coordinator.startProgressiveSearchScan()
+            val pausedState = awaitState(coordinator.search) {
+                it.swarmScan.status == SwarmScanStatus.Paused
+            }
+            assertEquals(5, pausedState.swarmScan.verifiedLiveCount)
+            assertEquals(5, pausedState.swarmScan.testedCount)
+            assertEquals(7, pausedState.swarmScan.totalCount)
+            assertEquals(0, pausedState.swarmScan.deadCount)
+            assertNull(pausedState.swarmScan.currentHash)
+
+            coordinator.resumeSearchScan()
+            val completedState = awaitState(coordinator.search) {
+                it.swarmScan.status == SwarmScanStatus.Completed
+            }
+            assertEquals(7, completedState.swarmScan.verifiedLiveCount)
+            assertEquals(7, completedState.swarmScan.testedCount)
+            assertEquals(7, completedState.swarmScan.totalCount)
+            assertEquals(7, completedState.probeResultsByHash.size)
+        } finally {
+            coordScope.cancel()
+            cacheDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun pauseSearchScanStopsRunningScanAndResumeContinuesRemaining() = runBlocking {
+        val cacheDir = Files.createTempDirectory("explore-scan-pause-test").toFile()
+        val coordScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val hashes = (1..4).map { idx -> (idx + 5).toString().repeat(40) }
+        try {
+            val repo = MetadataRepository(
+                network = HardenedNetworkClient(DohProvider.System),
+                cacheDir = cacheDir,
+            )
+            val fakeProvider = RecordingProvider(
+                info = SearchProviderInfo("knaben", "Knaben", "https://k.invalid", setOf(SearchCategory.Movies)),
+                onSearch = { _, _ ->
+                    hashes.mapIndexed { idx, hash ->
+                        SearchUtils.makeResult(
+                            providerId = "knaben",
+                            providerName = "Knaben",
+                            title = "Pauseable ${idx + 1} 1080p",
+                            magnetUri = "magnet:?xt=urn:btih:$hash",
+                            seeders = 40 - idx,
+                        )
+                    }
+                },
+            )
+            val gateFirstDone = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val allowContinue = kotlinx.coroutines.CompletableDeferred<Unit>()
+            var addCounter = 0
+            val idToHash = java.util.concurrent.ConcurrentHashMap<String, String>()
+            val fakeTransport = webtor.core.EngineTransport { method, path, body ->
+                when {
+                    method == "POST" && path == "/add" -> {
+                        val seq = ++addCounter
+                        if (seq == 2) {
+                            gateFirstDone.complete(Unit)
+                            kotlinx.coroutines.runBlocking { allowContinue.await() }
+                        }
+                        val hash = hashes.firstOrNull { body?.contains(it, ignoreCase = true) == true } ?: hashes[0]
+                        val id = "pause-$seq"
+                        idToHash[id] = hash
+                        webtor.core.EngineResponse(200, """{"id":"$id","infoHash":"$hash"}""")
+                    }
+                    method == "GET" && path.startsWith("/torrent/") -> {
+                        val id = path.removePrefix("/torrent/")
+                        val hash = idToHash[id] ?: hashes[0]
+                        webtor.core.EngineResponse(
+                            200,
+                            """{"id":"$id","infoHash":"$hash","ready":true,"done":false,"paused":false,"progress":0.02,"downloadSpeed":2000000,"uploadSpeed":0,"numPeers":10,"connectedSeeders":3,"swarmAvailability":3.0,"length":1000000000,"downloaded":65536,"uploaded":0,"files":[{"index":0,"name":"Pauseable.mp4","path":"Pauseable.mp4","length":1000000000,"progress":0.02,"type":"video/mp4"}]}""",
+                        )
+                    }
+                    method == "POST" && path == "/focus" -> webtor.core.EngineResponse(200, """{"ok":true}""")
+                    method == "POST" && path == "/remove" -> webtor.core.EngineResponse(200, """{"ok":true}""")
+                    else -> error("Unexpected $method $path")
+                }
+            }
+            val prober = org.cinito.online.search.SwarmDiagnosticsCoordinator(
+                engineClient = webtor.core.EngineClient(fakeTransport),
+                delayFn = {},
+                postReadySampleWindowMs = 0L,
+            )
+            val coordinator = ExploreCoordinator(
+                scope = coordScope,
+                metadataRepository = repo,
+                searchService = SearchService(listOf(fakeProvider)),
+                preferencesFlow = MutableStateFlow(
+                    AppPreferences(
+                        enabledProviderIds = setOf("knaben"),
+                        playabilityDiagnosticsMode = org.cinito.online.settings.PlayabilityDiagnosticsMode.LocalOnly,
+                    ),
+                ),
+                torznabFlow = MutableStateFlow(emptyList()),
+                onRecordRecentSearch = {},
+                swarmDiagnostics = prober,
+            )
+
+            coordinator.submitSearch("Pauseable")
+            awaitState(coordinator.search) { !it.isSearching && it.rawResults.size == 4 }
+
+            coordinator.startProgressiveSearchScan()
+            withTimeout(5_000) { gateFirstDone.await() }
+            val runningWithOne = awaitState(coordinator.search) {
+                it.swarmScan.status == SwarmScanStatus.Running && it.swarmScan.testedCount >= 1
+            }
+            assertEquals(1, runningWithOne.swarmScan.testedCount)
+
+            coordinator.pauseSearchScan()
+            val paused = awaitState(coordinator.search) {
+                it.swarmScan.status == SwarmScanStatus.Paused && it.swarmScan.currentHash == null
+            }
+            assertEquals(1, paused.swarmScan.testedCount)
+
+            allowContinue.complete(Unit)
+            coordinator.resumeSearchScan()
+            val completed = awaitState(coordinator.search) {
+                it.swarmScan.status == SwarmScanStatus.Completed
+            }
+            assertEquals(4, completed.swarmScan.testedCount)
+            assertEquals(4, completed.swarmScan.verifiedLiveCount)
+            assertEquals(4, completed.probeResultsByHash.size)
         } finally {
             coordScope.cancel()
             cacheDir.deleteRecursively()

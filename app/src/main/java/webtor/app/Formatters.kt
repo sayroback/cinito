@@ -316,10 +316,11 @@ fun prefetchStatus(draft: PrepareDraft?): String? {
     if (draft == null) return null
     val t = draft.torrent
     val peers = t?.numPeers ?: 0
+    val speed = "↓ ${formatSpeed(t?.downloadSpeed ?: 0L)}"
     return when {
-        t?.ready == true -> "Files ready · ${formatPeers(peers)}"
-        peers > 0 -> "Connecting · ${formatPeers(peers)}"
-        else -> "Finding peers…"
+        t?.ready == true -> "Files ready · ${formatPeers(peers)} · $speed"
+        peers > 0 -> "Connecting · ${formatPeers(peers)} · $speed"
+        else -> "Finding peers… · $speed"
     }
 }
 

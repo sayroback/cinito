@@ -33,6 +33,14 @@ pub const ANNOUNCE_ERROR_BACKOFF: Duration = Duration::from_secs(15);
 /// the loop rests this long; every state change still wakes it at once.
 const MIN_DISPATCH_SLEEP: Duration = Duration::from_millis(100);
 
+/// Quita la query de la URL del tracker antes de loguearla: suele llevar passkey.
+fn redact_tracker_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_string(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TorrentAnnounceKey {
     pub url: String,
@@ -79,6 +87,8 @@ struct SlotState {
     interval: Duration,
     /// Tells an announce finishing for a removed torrent from a re-added one.
     epoch: u64,
+    /// Announces started since the last success (logging only).
+    attempt: u32,
 }
 
 impl Default for SlotState {
@@ -91,6 +101,7 @@ impl Default for SlotState {
             sent_completed: false,
             interval: DEFAULT_ANNOUNCE_INTERVAL,
             epoch: 0,
+            attempt: 0,
         }
     }
 }
@@ -175,6 +186,9 @@ impl AnnounceDispatcher {
                 url: url.clone(),
                 info_hash,
             };
+            if !g.slots.contains_key(&key) {
+                log::info!(target: "webtor-engine", "tracker slot hash={} url={} created", &info_hash.to_hex()[..8], redact_tracker_url(&key.url));
+            }
             g.next_epoch += 1;
             let epoch = g.next_epoch;
             g.slots.entry(key).or_insert_with(|| SlotState {
@@ -218,6 +232,7 @@ impl AnnounceDispatcher {
         let keys: Vec<_> = g.slots.keys().filter(|k| k.info_hash == info_hash).cloned().collect();
         let opt = g.cfg.announce_opt.clone();
         let mut stops = Vec::new();
+        let removed = keys.len();
         for key in keys {
             let Some(slot) = g.slots.remove(&key) else { continue };
             // A slot still on Started never reached this tracker.
@@ -229,19 +244,35 @@ impl AnnounceDispatcher {
             }
         }
         drop(g);
+        log::info!(
+            target: "webtor-engine",
+            "tracker slots removed hash={} slots={removed} stopped={}",
+            &info_hash.to_hex()[..8], stops.len(),
+        );
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             for (client, req) in stops {
                 let opt = opt.clone();
+                let hash8 = info_hash.to_hex()[..8].to_string();
                 runtime.spawn(async move {
-                    let _ = client.announce(req, opt).await;
+                    match client.announce(req, opt).await {
+                        Ok(_) => log::debug!(target: "webtor-engine", "stopped announce ok hash={hash8}"),
+                        Err(e) => log::warn!(target: "webtor-engine", "stopped announce failed hash={hash8} err={e:?}"),
+                    }
                 });
             }
+        } else if !stops.is_empty() {
+            log::warn!(
+                target: "webtor-engine",
+                "stopped announces dropped hash={} count={} (no tokio runtime)",
+                &info_hash.to_hex()[..8], stops.len(),
+            );
         }
         self.wake.notify_one();
     }
 
     pub fn close(&self) {
         let mut g = self.inner.lock();
+        log::info!(target: "webtor-engine", "tracker dispatcher closed slots={}", g.slots.len());
         g.closed = true;
         drop(g);
         self.wake.notify_one();
@@ -316,14 +347,25 @@ impl AnnounceDispatcher {
                     .map(|s| s.event)
                     .unwrap_or(AnnounceEvent::None);
                 let Some(snap) = g.snapshots.get(&key.info_hash).cloned() else {
+                    // Slot stays due until the torrent snapshot arrives.
+                    log::debug!(target: "webtor-engine", "tracker due but no snapshot hash={} url={}", &key.info_hash.to_hex()[..8], redact_tracker_url(&key.url));
                     continue;
                 };
                 let req = announce_request(&snap, event);
                 let mut epoch = 0;
+                let mut attempt = 0;
                 if let Some(slot) = g.slots.get_mut(&key) {
                     slot.active = true;
+                    slot.attempt = slot.attempt.saturating_add(1);
                     epoch = slot.epoch;
+                    attempt = slot.attempt;
                 }
+                log::info!(
+                    target: "webtor-engine",
+                    "announce start hash={} url={} event={event:?} attempt={attempt} inflight={}",
+                    &key.info_hash.to_hex()[..8], redact_tracker_url(&key.url),
+                    g.url_inflight.get(&key.url).copied().unwrap_or(0) + 1,
+                );
                 *g.url_inflight.entry(key.url.clone()).or_insert(0) += 1;
                 let opt = g.cfg.announce_opt.clone();
                 out.push((key, event, req, opt, epoch));
@@ -388,6 +430,11 @@ impl AnnounceDispatcher {
         }
         // The torrent was removed while this ran; its result is not the new slot's.
         if g.slots.get(key).is_none_or(|slot| slot.epoch != epoch) {
+            log::debug!(
+                target: "webtor-engine",
+                "discarded announce result for removed torrent hash={} url={} event={event:?} ok={}",
+                &key.info_hash.to_hex()[..8], redact_tracker_url(&key.url), result.is_ok(),
+            );
             drop(g);
             self.wake.notify_one();
             return;
@@ -395,6 +442,14 @@ impl AnnounceDispatcher {
         let status_cb = g.cfg.status.clone();
         let peers_tx = g.cfg.peers_tx.clone();
         let now = Instant::now();
+        match &result {
+            Ok(r) => log::info!(
+                target: "webtor-engine",
+                "announce url={} event={event:?} ok peers={} seeders={} leechers={} interval={}",
+                redact_tracker_url(&key.url), r.peers.len(), r.seeders, r.leechers, r.interval,
+            ),
+            Err(e) => log::info!(target: "webtor-engine", "announce url={} event={event:?} err={e:?}", redact_tracker_url(&key.url)),
+        }
 
         match &result {
             Ok(resp) => {
@@ -406,6 +461,7 @@ impl AnnounceDispatcher {
                 if let Some(slot) = g.slots.get_mut(key) {
                     slot.active = false;
                     slot.last_failed = false;
+                    slot.attempt = 0;
                     // Go `lastAnnounceOk.Interval` uses tracker `interval` only
                     // (min interval is not applied to the schedule).
                     let interval = if resp.interval > 0 {
@@ -431,6 +487,12 @@ impl AnnounceDispatcher {
                         slot.event = AnnounceEvent::None;
                     }
                     let peers = resp.peers.clone();
+                    let next_in = slot.next_at.saturating_duration_since(now);
+                    log::debug!(
+                        target: "webtor-engine",
+                        "tracker next announce hash={} url={} next_in_ms={} want_peers={want_peers_now}",
+                        &key.info_hash.to_hex()[..8], redact_tracker_url(&key.url), next_in.as_millis(),
+                    );
                     drop(g);
                     self.wake.notify_one();
                     if let Some(cb) = &status_cb {
@@ -446,21 +508,39 @@ impl AnnounceDispatcher {
                         });
                     }
                     if let Some(tx) = peers_tx {
-                        let _ = tx.send((key.info_hash, peers));
+                        if let Err(e) = tx.send((key.info_hash, peers)) {
+                            log::warn!(
+                                target: "webtor-engine",
+                                "announce peers dropped hash={} count={} err=receiver closed: {e}",
+                                &key.info_hash.to_hex()[..8], resp.peers.len(),
+                            );
+                        }
                     }
                     return;
                 }
+                log::debug!(target: "webtor-engine", "announce ok but slot gone hash={} url={}", &key.info_hash.to_hex()[..8], redact_tracker_url(&key.url));
             }
             Err(err) => {
                 let msg = err.to_string();
+                let mut backoff_ms = 0u128;
+                let mut attempt = 0u32;
                 if let Some(slot) = g.slots.get_mut(key) {
                     slot.active = false;
                     slot.last_failed = true;
                     slot.next_at = now + ANNOUNCE_ERROR_BACKOFF;
+                    backoff_ms = ANNOUNCE_ERROR_BACKOFF.as_millis();
+                    attempt = slot.attempt;
                     // Keep Started so we retry as Started until first success.
                     if event != AnnounceEvent::Started && event != AnnounceEvent::Completed {
                         slot.event = AnnounceEvent::None;
                     }
+                }
+                if backoff_ms > 0 {
+                    log::info!(
+                        target: "webtor-engine",
+                        "tracker backoff hash={} url={} attempt={attempt} next_in_ms={backoff_ms}",
+                        &key.info_hash.to_hex()[..8], redact_tracker_url(&key.url),
+                    );
                 }
                 drop(g);
                 self.wake.notify_one();

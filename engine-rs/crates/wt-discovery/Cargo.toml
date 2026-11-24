@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+log = "0.4"
 wt-types.workspace = true
 wt-meta.workspace = true
 tokio = { workspace = true, features = ["full"] }

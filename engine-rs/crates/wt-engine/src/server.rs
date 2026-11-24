@@ -50,6 +50,101 @@ fn new_record_id() -> String {
     format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
 }
 
+/// First 8 characters of an info hash, for log lines.
+pub(crate) fn short_hash(hex: &str) -> &str {
+    &hex[..hex.len().min(8)]
+}
+
+/// Sum of file sizes under `path`; entries that cannot be read count as 0.
+pub(crate) fn dir_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries.flatten().map(|entry| dir_bytes(&entry.path())).sum()
+    })
+}
+
+/// Remove a temp directory, logging its path and freed bytes, or the error.
+pub(crate) fn remove_temp_dir(kind: &str, id: &str, path: &Path) {
+    if std::fs::symlink_metadata(path).is_err() {
+        return;
+    }
+    let bytes = dir_bytes(path);
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => crate::jni::log_info(&format!(
+            "cleanup removed kind={kind} id={id} path={} bytes={bytes}",
+            path.display()
+        )),
+        Err(err) => crate::jni::log_warn(&format!(
+            "cleanup failed kind={kind} id={id} path={} bytesBefore={bytes}: {err}",
+            path.display()
+        )),
+    }
+}
+
+/// Error text of a control response: its `error` field, else the body head.
+fn control_error_text(body: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
+            return err.to_owned();
+        }
+    }
+    String::from_utf8_lossy(body).trim().chars().take(160).collect()
+}
+
+/// Per-torrent probe timeline. Each transition is logged once, with elapsed
+/// milliseconds since the add; the sampler checks it once per second.
+pub(crate) struct ProbeMarks {
+    added_at: Instant,
+    metadata: bool,
+    peer: bool,
+    payload: bool,
+}
+
+impl ProbeMarks {
+    pub(crate) fn new(added_at: Instant) -> Self {
+        Self { added_at, metadata: false, peer: false, payload: false }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        id: &str,
+        info_hash: &str,
+        prepared: bool,
+        metadata_ready: bool,
+        peers: usize,
+        payload_bytes: i64,
+    ) {
+        let elapsed = self.added_at.elapsed().as_millis();
+        let hash = short_hash(info_hash);
+        if !self.metadata && metadata_ready {
+            self.metadata = true;
+            crate::jni::log_info(&format!(
+                "metadata ready id={id} hash={hash} prepare={prepared} elapsedMs={elapsed}"
+            ));
+        }
+        if !self.peer && peers > 0 {
+            self.peer = true;
+            crate::jni::log_info(&format!(
+                "first peer id={id} hash={hash} peers={peers} elapsedMs={elapsed}"
+            ));
+        }
+        if !self.payload && payload_bytes > 0 {
+            self.payload = true;
+            crate::jni::log_info(&format!(
+                "first payload id={id} hash={hash} bytes={payload_bytes} elapsedMs={elapsed}"
+            ));
+        }
+    }
+}
+
 pub struct TorrentRecord {
     pub torrent: wt_core::Torrent,
     pub(crate) playback_coordinator: Arc<crate::playback::PlaybackPriorityCoordinator>,
@@ -93,6 +188,8 @@ pub struct TorrentRecord {
     pub(crate) preload_plan: wt_policy::NextPreload,
     /// Go `reconnectPeers`: dialable addresses kept across network handoffs.
     pub(crate) reconnect_peers: Vec<wt_core::PeerInfo>,
+    /// Probe timeline (metadata, first peer, first payload) for lifecycle logs.
+    pub(crate) probe: ProbeMarks,
 }
 
 impl TorrentRecord {
@@ -513,12 +610,17 @@ impl EngineServer {
     }
 
     pub fn close_preview_for(&self, id: &str) {
+        self.close_preview_for_reason(id, "closed by engine");
+    }
+
+    /// Close the active preview of `id`; `reason` names the closer in cancelled reads.
+    pub fn close_preview_for_reason(&self, id: &str, reason: &'static str) {
         let mut active_id = self.preview_active_id.lock();
         if active_id.as_deref() == Some(id) {
             *active_id = None;
             let p = self.preview_active.lock().take();
             if let Some(reader) = p {
-                reader.close();
+                reader.close_with_reason(reason);
             }
         }
     }
@@ -560,7 +662,12 @@ impl EngineServer {
         if let Some(info) = torrent.info() {
             if torrent.num_pieces() > 0 {
                 use wt_types::ClientStorage;
-                let _ = self.storage.open_torrent(&info, torrent.info_hash());
+                if let Err(err) = self.storage.open_torrent(&info, torrent.info_hash()) {
+                    crate::jni::log_warn(&format!(
+                        "storage open failed hash={}: {err}",
+                        short_hash(&torrent.info_hash().to_hex())
+                    ));
+                }
             }
         }
         self.storage.get_storage(&hex)
@@ -793,7 +900,7 @@ impl EngineServer {
         self.client.close();
         let preview = self.preview_active.lock().take();
         if let Some(p) = preview {
-            p.close();
+            p.close_with_reason("engine shutdown");
         }
         *self.preview_active_id.lock() = None;
         self.notify_change();
@@ -805,6 +912,9 @@ impl EngineServer {
 
     pub fn dispatch_control_bytes(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
         if self.shutting_down.load(Ordering::SeqCst) {
+            if method == "POST" {
+                crate::jni::log_warn(&format!("control POST {path} status=503 reason=engine is shutting down"));
+            }
             return (
                 503,
                 serde_json::to_vec(&json!({"error": "engine is shutting down"})).unwrap(),
@@ -898,6 +1008,13 @@ impl EngineServer {
                 serde_json::to_vec(&json!({"error": "not found"})).unwrap(),
             ),
         };
+        if response.0 >= 400 && method == "POST" {
+            crate::jni::log_warn(&format!(
+                "control POST /{endpoint} status={} reason={}",
+                response.0,
+                control_error_text(&response.1)
+            ));
+        }
         if response.0 == 200 && method == "POST"
             && matches!(parts.first().copied(), Some("configure" | "select" | "play" | "pause" | "resume" | "remove" | "network" | "file-only" | "focus"))
         {
@@ -1114,8 +1231,14 @@ impl EngineServer {
         prepare: bool,
         torrent_bytes: Option<Vec<u8>>,
     ) -> (u16, Vec<u8>) {
+        let added_at = Instant::now();
         if let Some(hash) = spec.info_hash {
             if let Some(existing) = self.records_by_hash.read().get(&hash.to_hex()) {
+                crate::jni::log_info(&format!(
+                    "add dedupe-existing hash={} id={} prepare={prepare}",
+                    &hash.to_hex()[..8],
+                    existing.read().id,
+                ));
                 return (
                     200,
                     serde_json::to_vec(&AddResponse {
@@ -1127,10 +1250,16 @@ impl EngineServer {
             }
         }
         spec.trackers = crate::trackers::clean_supplied_trackers(&spec.trackers);
+        crate::jni::log_info(&format!("add trackers n={}", spec.trackers.len()));
         let original_trackers = spec.trackers.clone();
+        let spec_hash = spec.info_hash.as_ref().map(|h| h.to_hex());
         let (torrent, _) = match self.client.add_torrent_spec(spec) {
             Ok(t) => t,
             Err(e) => {
+                crate::jni::log_warn(&format!(
+                    "add failed hash={} prepare={prepare} reason={e}",
+                    spec_hash.as_deref().map_or("-", |h| short_hash(h)),
+                ));
                 return (
                     400,
                     serde_json::to_vec(&json!({"error":e.to_string()})).unwrap(),
@@ -1180,7 +1309,20 @@ impl EngineServer {
                 i.piece((total_pieces - 1) as u32).length
             }
         });
-        let mut magnet = url::Url::parse(&record_magnet_base(&torrent)).unwrap();
+        let mut magnet = match url::Url::parse(&record_magnet_base(&torrent)) {
+            Ok(url) => url,
+            Err(err) => {
+                crate::jni::log_warn(&format!(
+                    "add failed hash={} prepare={prepare} reason=magnet base: {err}",
+                    short_hash(&info_hash),
+                ));
+                torrent.drop_torrent();
+                return (
+                    400,
+                    serde_json::to_vec(&json!({"error": err.to_string()})).unwrap(),
+                );
+            }
+        };
         for tracker in original_trackers.iter().flatten() {
             magnet.query_pairs_mut().append_pair("tr", tracker);
         }
@@ -1229,6 +1371,7 @@ impl EngineServer {
             idle_drop_ready: false,
             preload_plan: Default::default(),
             reconnect_peers: Vec::new(),
+            probe: ProbeMarks::new(added_at),
         }));
 
         {
@@ -1236,6 +1379,11 @@ impl EngineServer {
             let mut records = self.records.write();
             let mut by_hash = self.records_by_hash.write();
             if let Some(existing) = by_hash.get(&info_hash) {
+                crate::jni::log_info(&format!(
+                    "add dedupe-existing-locked hash={} id={} prepare={prepare}",
+                    &info_hash[..info_hash.len().min(8)],
+                    existing.read().id,
+                ));
                 return (
                     200,
                     serde_json::to_vec(&AddResponse {
@@ -1248,6 +1396,11 @@ impl EngineServer {
             records.insert(id.clone(), rec.clone());
             by_hash.insert(info_hash.clone(), rec.clone());
         }
+        let (torrents, total_peers) = self.engine_peer_summary();
+        crate::jni::log_info(&format!(
+            "add new id={id} hash={} prepare={prepare} torrentsNow={torrents} peersNow={total_peers}",
+            &info_hash[..info_hash.len().min(8)],
+        ));
         self.supplement_trackers(&rec);
         self.watch_metadata(&torrent, &rec);
         self.start_metadata_sources(&torrent, metadata_sources);
@@ -1436,11 +1589,20 @@ impl EngineServer {
         if let Some(offset) = req.offset {
             rec.playback_coordinator.prepare_resume(file_index, offset.clamp(0, (file.length - 1).max(0)));
         }
-        self.apply_transfer_state(&mut rec);
-        drop(rec);
+        // Plan startup pieces first so the transfer state already sees them.
         if let Some(storage) = self.storage_for_torrent(&torrent) {
             storage.set_startup_file(file_index);
         }
+        self.apply_transfer_state(&mut rec);
+        // Point peers at the file start now, before any HTTP reader connects.
+        let focus_abs = rec.torrent.files().get(file_index).map(|f| {
+            f.offset() + req.offset.unwrap_or(0).clamp(0, (file.length - 1).max(0))
+        });
+        if let Some(abs) = focus_abs {
+            rec.torrent.set_request_focus(abs);
+            rec.torrent.nudge_urgent_requests();
+        }
+        drop(rec);
         self.notify_change();
         let stream_url = format!(
             "http://127.0.0.1:{}/torrent/{}/file/{}",
@@ -1577,7 +1739,7 @@ impl EngineServer {
 
         let selected = req.selected.unwrap_or_default();
         let descriptors = req.descriptors.unwrap_or_default();
-        self.close_preview_for(&req.id);
+        self.close_preview_for_reason(&req.id, "configure");
 
         if let Err(error) = self.wait_for_info(&torrent) {
             return (409, serde_json::to_vec(&json!({"error": error})).unwrap());
@@ -1653,7 +1815,10 @@ impl EngineServer {
         // Go applyPeerHints: reconnect peers that worked last time at once.
         self.apply_peer_hints(&rec);
         let verification = if !stream && storage.needs_verify() {
-            let info = torrent.info().expect("configured torrent metadata");
+            let Some(info) = torrent.info() else {
+                crate::jni::log_warn(&format!("configure id={} hash={}: metadata missing before verify", req.id, short_hash(&rec.info_hash)));
+                return (409, serde_json::to_vec(&json!({"error": "metadata not ready"})).unwrap());
+            };
             let total = torrent.files().iter().filter(|f| rec.selected.contains(&f.index()))
                 .flat_map(|f| (f.offset() / info.piece_length) as usize..
                     ((f.offset() + f.length() + info.piece_length - 1) / info.piece_length) as usize)
@@ -1784,7 +1949,7 @@ impl EngineServer {
         };
         if let Some(r) = self.record_by_id(&req.id) {
             if pause {
-                self.close_preview_for(&req.id);
+                self.close_preview_for_reason(&req.id, "paused");
             }
             let mut rec = r.write();
             rec.paused = pause;
@@ -1802,6 +1967,13 @@ impl EngineServer {
         }
     }
 
+    /// Torrents and total connected peers across the engine; logged on add/remove to spot global peer loss.
+    fn engine_peer_summary(&self) -> (usize, usize) {
+        let records = self.records.read();
+        let peers = records.values().map(|rec| rec.read().torrent.stats().total_peers).sum();
+        (records.len(), peers)
+    }
+
     fn handle_remove(&self, body: &str) -> (u16, Vec<u8>) {
         let req: IdRequest = match serde_json::from_str(body) {
             Ok(r) => r,
@@ -1812,7 +1984,7 @@ impl EngineServer {
                 )
             }
         };
-        self.close_preview_for(&req.id);
+        self.close_preview_for_reason(&req.id, "torrent removed");
         // Detach before closing readers: their callbacks re-enter the host.
         let rec = {
             let mut records = self.records.write();
@@ -1830,7 +2002,15 @@ impl EngineServer {
             if let Some(progress) = &rec.verification { progress.cancel(); }
             (rec.torrent.clone(), rec.info_hash.clone())
         };
+        let peers_at_remove = torrent.stats().total_peers;
         torrent.drop_torrent();
+        let (left, total_peers_left) = self.engine_peer_summary();
+        crate::jni::log_info(&format!(
+            "remove id={} hash={} destroy={} peersBefore={peers_at_remove} torrentsLeft={left} peersLeft={total_peers_left}",
+            req.id,
+            &hash[..hash.len().min(8)],
+            req.destroy_store.unwrap_or(true),
+        ));
         let readers = {
             let mut registry = self.playback_readers.lock();
             let handles: Vec<_> = registry.iter().filter(|(_, r)| r.id == req.id)
@@ -1840,20 +2020,65 @@ impl EngineServer {
         for reader in readers { reader.close(); }
         if let Some(storage) = self.storage.get_storage(&hash) {
             storage.set_on_stream_evict(None);
-            let _ = wt_types::TorrentStorage::close(storage.as_ref());
+            if let Err(err) = wt_types::TorrentStorage::close(storage.as_ref()) {
+                crate::jni::log_warn(&format!(
+                    "remove storage close failed id={} hash={}: {err}",
+                    req.id,
+                    short_hash(&hash),
+                ));
+            }
         }
-        let _ = self.storage.remove_torrent(torrent.info_hash());
+        if let Err(err) = self.storage.remove_torrent(torrent.info_hash()) {
+            crate::jni::log_warn(&format!(
+                "remove storage detach failed id={} hash={}: {err}",
+                req.id,
+                short_hash(&hash),
+            ));
+        }
         // Go: a missing destroyStore means destroy.
         if req.destroy_store.unwrap_or(true) {
             // A Drop keeps the library entry; its peers reconnect on the next Play.
             self.peer_hints.lock().forget_peer_hints(&self.download_dir, &hash);
-            let _ = self.storage.delete_checkpoint(&hash);
-            let _ = wt_storage::delete_engine_owned_storage(&self.download_dir, &hash);
-            let _ = std::fs::remove_dir_all(wt_storage::resume_window_dir(&self.download_dir, &hash));
+            if let Err(err) = self.storage.delete_checkpoint(&hash) {
+                crate::jni::log_warn(&format!(
+                    "cleanup checkpoint failed id={} hash={}: {err}",
+                    req.id,
+                    short_hash(&hash),
+                ));
+            }
+            self.purge_engine_storage(&req.id, &hash);
+            remove_temp_dir(
+                "resume-window",
+                &req.id,
+                &wt_storage::resume_window_dir(&self.download_dir, &hash),
+            );
         }
         self.tracker_status.clear_status(&hash);
         self.notify_change();
         (200, serde_json::to_vec(&OkResponse { ok: true, id: Some(req.id) }).unwrap())
+    }
+
+    /// Engine-owned temp dirs of `hash`: sizes logged before and after the wt-storage purge.
+    fn purge_engine_storage(&self, id: &str, hash: &str) {
+        const OWNED: [&str; 4] = [".stream", ".boundary", ".startup", ".preview"];
+        let dirs: Vec<PathBuf> = OWNED.iter().map(|d| self.download_dir.join(d).join(hash)).collect();
+        let sizes: Vec<u64> = dirs.iter().map(|d| dir_bytes(d)).collect();
+        if let Err(err) = wt_storage::delete_engine_owned_storage(&self.download_dir, hash) {
+            crate::jni::log_warn(&format!("cleanup engine-owned failed id={id} hash={}: {err}", short_hash(hash)));
+        }
+        for (dir, bytes) in dirs.iter().zip(sizes) {
+            if dir.exists() {
+                crate::jni::log_warn(&format!(
+                    "cleanup left path kind=engine-owned id={id} path={} bytesBefore={bytes}",
+                    dir.display()
+                ));
+            } else if bytes > 0 {
+                crate::jni::log_info(&format!(
+                    "cleanup removed kind=engine-owned id={id} path={} bytes={bytes}",
+                    dir.display()
+                ));
+            }
+        }
     }
 
     fn handle_forget_peers(&self, body: &str) -> (u16, Vec<u8>) {
@@ -2451,9 +2676,25 @@ impl EngineServer {
     }
 
     pub fn open_preview(&self, id: &str, index: usize) -> std::io::Result<Arc<PreviewReader>> {
-        let reader = crate::preview::open_preview(self, id, index)?;
-        *self.preview_active_id.lock() = Some(id.to_string());
-        Ok(reader)
+        let started = Instant::now();
+        crate::jni::log_info(&format!("open_preview start id={id} index={index}"));
+        match crate::preview::open_preview(self, id, index) {
+            Ok(reader) => {
+                *self.preview_active_id.lock() = Some(id.to_string());
+                crate::jni::log_info(&format!(
+                    "open_preview done id={id} index={index} elapsedMs={}",
+                    started.elapsed().as_millis()
+                ));
+                Ok(reader)
+            }
+            Err(err) => {
+                crate::jni::log_warn(&format!(
+                    "open_preview failed id={id} index={index} elapsedMs={} reason={err}",
+                    started.elapsed().as_millis()
+                ));
+                Err(err)
+            }
+        }
     }
 }
 

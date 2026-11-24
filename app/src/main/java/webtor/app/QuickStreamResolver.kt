@@ -9,6 +9,8 @@ sealed interface QuickStreamPlan {
     data object NeedsFileSelection : QuickStreamPlan
 }
 
+private val SAMPLE_VIDEO_REGEX = Regex("""(?i)\b(sample|trailer|teaser|featurette|preview|rarbg\.com|etrg)\b""")
+
 /**
  * Decides whether a newly resolved torrent can start streaming immediately (1 video or exact
  * episode match in a pack) or needs the user to pick a specific file/episode.
@@ -20,15 +22,26 @@ fun resolveQuickStreamSelection(
     val videos = files.filter { it.name.isVideoName() || it.path.isVideoName() }
     if (videos.isEmpty()) return QuickStreamPlan.NeedsFileSelection
 
-    if (videos.size == 1) {
-        val chosen = videos.first()
+    val mainVideos = if (videos.size >= 2) {
+        val maxVideoSize = videos.maxOf { it.length }
+        videos.filterNot { file ->
+            val label = file.path.ifBlank { file.name }
+            SAMPLE_VIDEO_REGEX.containsMatchIn(label) ||
+                (maxVideoSize >= 50L * 1024 * 1024 && file.length > 0 && file.length < maxVideoSize * 0.05)
+        }.ifEmpty { videos }
+    } else {
+        videos
+    }
+
+    if (mainVideos.size == 1) {
+        val chosen = mainVideos.first()
         return QuickStreamPlan.AutoPlay(selectVideoWithMatchingSubtitles(files, chosen))
     }
 
     val season = target?.season
     val episode = target?.episode
     if (season != null && episode != null) {
-        val exactMatch = videos.filter { file ->
+        val exactMatch = mainVideos.filter { file ->
             val parsed = MediaTitleParser.parse(file.path.ifBlank { file.name })
             (parsed.season == season && parsed.episode == episode) ||
                 (season == 1 && parsed.season == null && parsed.episode == episode)
@@ -70,7 +83,7 @@ fun findMatchingEpisodeFileIndex(
     return null
 }
 
-private fun selectVideoWithMatchingSubtitles(
+fun selectVideoWithMatchingSubtitles(
     files: List<TorrentFile>,
     video: TorrentFile,
 ): Set<Int> {

@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.InputChip
@@ -46,10 +47,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -57,6 +60,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 import org.cinito.online.cast.CastSessionState
 import org.cinito.online.cast.WebOsCastMode
 import org.cinito.online.ui.player.CastTopBarActionButton
@@ -69,7 +73,9 @@ import org.cinito.online.search.SearchSortOrder
 import org.cinito.online.search.TorrentSearchResult
 import org.cinito.online.search.TorznabConfig
 import org.cinito.online.ui.explore.SearchUiState
+import org.cinito.online.ui.explore.SwarmScanStatus
 import org.cinito.online.ui.explore.TorrentReleaseCard
+import org.cinito.online.ui.explore.filterSearchPlayableResults
 import org.cinito.online.ui.explore.isResultInLibrary
 import org.cinito.online.ui.theme.CinemaColors
 import org.cinito.online.ui.theme.CinemaCompactPill
@@ -84,8 +90,13 @@ fun SearchScreen(
     state: SearchUiState,
     recentQueries: List<String>,
     enabledProviderIds: Set<String>,
+    disabledAdultProviderIds: Set<String> = emptySet(),
     torznabConfigs: List<TorznabConfig>,
     library: List<DownloadEntry>,
+    hideAdultContent: Boolean = true,
+    adultOnlySearch: Boolean = false,
+    onDisableAdultOnlySearch: (() -> Unit)? = null,
+    onToggleHideDeadResults: ((Boolean) -> Unit)? = null,
     isCastingToTv: Boolean = false,
     activeWebOsMode: WebOsCastMode? = null,
     castState: CastSessionState = CastSessionState(),
@@ -100,6 +111,9 @@ fun SearchScreen(
     onInspectResult: (TorrentSearchResult) -> Unit,
     onDiagnoseTop: (() -> Unit)? = null,
     onDiagnoseResult: ((TorrentSearchResult) -> Unit)? = null,
+    onStartScan: ((Int) -> Unit)? = null,
+    onPauseScan: (() -> Unit)? = null,
+    onResumeScan: (() -> Unit)? = null,
     onStreamResult: (TorrentSearchResult, Int?, Int?) -> Unit,
     onChooseFilesResult: (TorrentSearchResult) -> Unit,
     onRemoveRecentQuery: (String) -> Unit,
@@ -113,6 +127,22 @@ fun SearchScreen(
     var sortExpanded by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
+    val isAdultMode = !hideAdultContent && (adultOnlySearch || state.category == SearchCategory.Adult)
+    val activeProviderCount = remember(enabledProviderIds, disabledAdultProviderIds, torznabConfigs, isAdultMode) {
+        if (isAdultMode) {
+            val nonAdultProviders = setOf(
+                "yts", "nyaa", "torrentio", "eztv", "internetarchive",
+                "limetorrents", "bitsearch", "torrentscsv", "subsplease",
+            )
+            val disabledLower = disabledAdultProviderIds.mapTo(HashSet()) { it.lowercase(Locale.ROOT) }
+            enabledProviderIds.count {
+                val id = it.lowercase(Locale.ROOT)
+                id !in nonAdultProviders && id !in disabledLower
+            } + torznabConfigs.count { SearchCategory.Adult in it.categories }
+        } else {
+            enabledProviderIds.size + torznabConfigs.size
+        }
+    }
 
     val libraryHashes = remember(library) {
         library.map { it.key.lowercase(Locale.ROOT) }.toSet()
@@ -150,9 +180,16 @@ fun SearchScreen(
             probeResultsByHash = state.probeResultsByHash,
         )
     }
-    val topRecommendedId = remember(sortedResults, assessmentsById, state.sortOrder) {
+    val filteredResults = remember(sortedResults, assessmentsById, state.hideDeadResults) {
+        filterSearchPlayableResults(sortedResults, assessmentsById, state.hideDeadResults)
+    }
+    val visibleResults = filteredResults.visible
+    val hiddenDeadCount = filteredResults.hiddenDeadCount
+    val latestIds = remember(visibleResults) { visibleResults.map { it.id } }
+    val resultsById = remember(visibleResults) { visibleResults.associateBy { it.id } }
+    val topRecommendedId = remember(visibleResults, assessmentsById, state.sortOrder) {
         if (state.sortOrder != SearchSortOrder.BestPlayability) null
-        else sortedResults.firstOrNull()?.id?.takeIf { id ->
+        else visibleResults.firstOrNull()?.id?.takeIf { id ->
             val v = assessmentsById[id]?.verdict
             v == PlayabilityVerdict.Optimal || v == PlayabilityVerdict.Good
         }
@@ -161,6 +198,27 @@ fun SearchScreen(
     val listState = remember(state.submittedQuery, state.category) {
         LazyListState(state.scrollIndex, state.scrollOffset)
     }
+    val coroutineScope = rememberCoroutineScope()
+    var anchoredIds by remember(
+        state.submittedQuery,
+        state.category,
+        state.sortOrder,
+        state.languageFilter,
+        state.hideDeadResults,
+    ) {
+        mutableStateOf(latestIds)
+    }
+    LaunchedEffect(latestIds, listState.firstVisibleItemIndex, listState.isScrollInProgress) {
+        val scanning = state.swarmScan.status == org.cinito.online.ui.explore.SwarmScanStatus.Running
+        val manualSingle = !scanning && state.probeResultsByHash.isNotEmpty() && !state.isSearching
+        if (anchoredIds.isEmpty() || (!manualSingle && listState.firstVisibleItemIndex <= 1 && !listState.isScrollInProgress)) {
+            anchoredIds = latestIds
+        }
+    }
+    val displayResults = remember(anchoredIds, resultsById) {
+        anchoredIds.mapNotNull { resultsById[it] }
+    }
+    val hasPendingReorder = anchoredIds != latestIds
     LaunchedEffect(listState) {
         snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
             .distinctUntilChanged()
@@ -189,9 +247,13 @@ fun SearchScreen(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = "Motores HTTPS + DoH · ${enabledProviderIds.size + torznabConfigs.size} activos",
+                    text = if (isAdultMode) {
+                        "Modo +18 · $activeProviderCount fuentes compatibles"
+                    } else {
+                        "Motores HTTPS + DoH · $activeProviderCount activos"
+                    },
                     style = MaterialTheme.typography.bodySmall.tabular(),
-                    color = CinemaColors.TextSecondary,
+                    color = if (isAdultMode) CinemaColors.Danger else CinemaColors.TextSecondary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -269,10 +331,50 @@ fun SearchScreen(
             }
         }
 
+        if (!hideAdultContent && adultOnlySearch) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                shape = RoundedCornerShape(10.dp),
+                color = CinemaColors.Danger.copy(alpha = 0.14f),
+                border = BorderStroke(1.dp, CinemaColors.Danger.copy(alpha = 0.4f)),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "Modo exclusivo +18 activo",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = CinemaColors.Danger,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (onDisableAdultOnlySearch != null) {
+                        TextButton(
+                            onClick = onDisableAdultOnlySearch,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        ) {
+                            Text(
+                                text = "Desactivar",
+                                color = CinemaColors.TextPrimary,
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         CinemaCompactSearchField(
             query = state.query,
             submittedQuery = state.submittedQuery,
-            placeholder = "Película, serie, anime o año…",
+            placeholder = if (isAdultMode) "Buscar contenido +18…" else "Película, serie, anime o año…",
             submitContentDescription = "Buscar ahora",
             modifier = Modifier.padding(horizontal = 16.dp),
             onQueryChange = onQueryChange,
@@ -293,28 +395,65 @@ fun SearchScreen(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            items(SearchCategory.entries) { cat ->
+            val visibleCategories = SearchCategory.entries.filter { it != SearchCategory.Adult || !hideAdultContent }
+            items(visibleCategories) { cat ->
+                val isAdultCat = cat == SearchCategory.Adult
                 CinemaCompactPill(
                     label = cat.label,
                     selected = state.category == cat,
+                    accentBorderColor = if (isAdultCat) CinemaColors.Danger else CinemaColors.Primary,
+                    selectedContainerColor = if (isAdultCat) CinemaColors.Danger.copy(alpha = 0.20f) else CinemaColors.PrimaryMuted,
+                    selectedTextColor = if (isAdultCat) CinemaColors.Danger else Color.White,
                     onClick = { onCategoryChange(cat) },
                 )
             }
         }
 
         LazyRow(
-            modifier = Modifier.padding(bottom = 8.dp),
+            modifier = Modifier
+                .padding(bottom = if (isAdultMode) 2.dp else 8.dp)
+                .alpha(if (isAdultMode) 0.42f else 1f),
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             items(SearchLanguageFilter.entries) { filter ->
                 CinemaCompactPill(
                     label = filter.label,
-                    selected = state.languageFilter == filter,
+                    selected = if (isAdultMode) filter == SearchLanguageFilter.AllLanguages else state.languageFilter == filter,
                     accentBorderColor = CinemaColors.Secondary.copy(alpha = 0.7f),
                     selectedContainerColor = CinemaColors.Secondary.copy(alpha = 0.18f),
                     selectedTextColor = CinemaColors.Secondary,
-                    onClick = { onLanguageFilterChange(filter) },
+                    onClick = { if (!isAdultMode) onLanguageFilterChange(filter) },
+                )
+            }
+        }
+        if (isAdultMode) {
+            Text(
+                text = "Idioma: Todos en +18",
+                style = MaterialTheme.typography.labelSmall,
+                color = CinemaColors.TextSecondary,
+                modifier = Modifier.padding(start = 18.dp, end = 18.dp, bottom = 6.dp),
+            )
+        }
+        if (hiddenDeadCount > 0 || !state.hideDeadResults) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.Start,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CinemaCompactPill(
+                    label = if (state.hideDeadResults) {
+                        "Mostrar sin fuentes ($hiddenDeadCount)"
+                    } else {
+                        "Solo con fuentes"
+                    },
+                    selected = !state.hideDeadResults,
+                    accentBorderColor = CinemaColors.Gold.copy(alpha = 0.7f),
+                    selectedContainerColor = CinemaColors.Gold.copy(alpha = 0.16f),
+                    selectedTextColor = CinemaColors.Gold,
+                    onClick = { onToggleHideDeadResults?.invoke(!state.hideDeadResults) },
                 )
             }
         }
@@ -465,6 +604,160 @@ fun SearchScreen(
             return@Column
         }
 
+        if (!state.isSearching && visibleResults.isNotEmpty()) {
+            val scan = state.swarmScan
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp),
+                color = CinemaColors.Surface,
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .padding(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        when (scan.status) {
+                            SwarmScanStatus.Idle -> {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    listOf(3, 5).forEach { n ->
+                                        Surface(
+                                            onClick = { onStartScan?.invoke(n) },
+                                            enabled = onStartScan != null,
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = CinemaColors.Secondary.copy(alpha = 0.16f),
+                                            border = BorderStroke(1.dp, CinemaColors.Secondary.copy(alpha = 0.42f)),
+                                        ) {
+                                            Text(
+                                                text = "▶ Probar $n",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = CinemaColors.Secondary,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            SwarmScanStatus.Running -> {
+                                Surface(
+                                    onClick = { onPauseScan?.invoke() },
+                                    enabled = onPauseScan != null,
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = CinemaColors.Gold.copy(alpha = 0.16f),
+                                    border = BorderStroke(1.dp, CinemaColors.Gold.copy(alpha = 0.45f)),
+                                ) {
+                                    Text(
+                                        text = "⏸ Pausar · ${scan.done}/${scan.total}",
+                                        style = MaterialTheme.typography.labelMedium.tabular(),
+                                        color = CinemaColors.Gold,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    )
+                                }
+                            }
+
+                            SwarmScanStatus.Paused -> {
+                                val pausedLabel = "▶ Siguientes · ${scan.done}/${scan.total} ✓${scan.ok}"
+                                Surface(
+                                    onClick = { onResumeScan?.invoke() },
+                                    enabled = onResumeScan != null,
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = CinemaColors.Secondary.copy(alpha = 0.16f),
+                                    border = BorderStroke(1.dp, CinemaColors.Secondary.copy(alpha = 0.42f)),
+                                ) {
+                                    Text(
+                                        text = pausedLabel,
+                                        style = MaterialTheme.typography.labelMedium.tabular(),
+                                        color = CinemaColors.Secondary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    )
+                                }
+                            }
+
+                            SwarmScanStatus.Completed -> {
+                                Text(
+                                    text = "✓ ${scan.done}/${scan.total} probadas",
+                                    style = MaterialTheme.typography.labelMedium.tabular(),
+                                    color = CinemaColors.Secondary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            if (scan.status != SwarmScanStatus.Idle) {
+                                Text(
+                                    text = "✓ ${scan.ok} · ✗ ${scan.dead}",
+                                    style = MaterialTheme.typography.labelSmall.tabular(),
+                                    color = CinemaColors.TextSecondary,
+                                    maxLines = 1,
+                                )
+                            } else {
+                                Text(
+                                    text = "${visibleResults.size} opciones",
+                                    style = MaterialTheme.typography.labelSmall.tabular(),
+                                    color = CinemaColors.TextSecondary,
+                                    maxLines = 1,
+                                )
+                            }
+                            if (hasPendingReorder) {
+                                Surface(
+                                    onClick = {
+                                        anchoredIds = latestIds
+                                        coroutineScope.launch { listState.animateScrollToItem(0) }
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = CinemaColors.PrimaryMuted,
+                                    border = BorderStroke(1.dp, CinemaColors.Primary.copy(alpha = 0.45f)),
+                                ) {
+                                    Text(
+                                        text = "Mover verificadas ↑",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = CinemaColors.PrimarySoft,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    if (scan.status == SwarmScanStatus.Running) {
+                        LinearProgressIndicator(
+                            progress = {
+                                if (scan.total > 0) scan.done.toFloat() / scan.total.toFloat() else 0f
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(2.dp),
+                            color = CinemaColors.Secondary,
+                            trackColor = CinemaColors.SurfaceBright,
+                        )
+                    } else {
+                        HorizontalDivider(
+                            thickness = 0.5.dp,
+                            color = CinemaColors.HairlineBorder,
+                        )
+                    }
+                }
+            }
+        }
+
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
@@ -488,7 +781,7 @@ fun SearchScreen(
                     }
                 }
             }
-            if (!state.isSearching && sortedResults.isEmpty()) {
+            if (!state.isSearching && visibleResults.isEmpty()) {
                 item(key = "no_results") {
                     Surface(
                         shape = RoundedCornerShape(14.dp),
@@ -504,7 +797,13 @@ fun SearchScreen(
                                 ?.let { " (ni como \"$it\")" }
                                 .orEmpty()
                             Text(
-                                text = "Sin resultados para \"${state.submittedQuery}\"$altNote en ${state.category.label} con \"${state.languageFilter.label}\".",
+                                text = if (hiddenDeadCount > 0) {
+                                    "Se ocultaron $hiddenDeadCount resultados sin fuentes"
+                                } else if (isAdultMode) {
+                                    "Sin resultados +18 para \"${state.submittedQuery}\"$altNote. Solo se consultaron fuentes compatibles con contenido +18."
+                                } else {
+                                    "Sin resultados para \"${state.submittedQuery}\"$altNote en ${state.category.label} con \"${state.languageFilter.label}\"."
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = CinemaColors.TextSecondary,
                             )
@@ -512,12 +811,17 @@ fun SearchScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                if (state.languageFilter != SearchLanguageFilter.AllLanguages) {
+                                if (hiddenDeadCount > 0) {
+                                    OutlinedButton(onClick = { onToggleHideDeadResults?.invoke(false) }) {
+                                        Text("Mostrar sin fuentes")
+                                    }
+                                }
+                                if (!isAdultMode && state.languageFilter != SearchLanguageFilter.AllLanguages) {
                                     OutlinedButton(onClick = { onLanguageFilterChange(SearchLanguageFilter.AllLanguages) }) {
                                         Text("Ver todos los idiomas")
                                     }
                                 }
-                                if (state.category != SearchCategory.All) {
+                                if (!adultOnlySearch && state.category != SearchCategory.All) {
                                     OutlinedButton(onClick = { onCategoryChange(SearchCategory.All) }) {
                                         Text("Buscar en Todo")
                                     }
@@ -530,41 +834,7 @@ fun SearchScreen(
                     }
                 }
             }
-            if (onDiagnoseTop != null && sortedResults.isNotEmpty() && !state.isSearching) {
-                item(key = "diagnose_top_row") {
-                    val isProbing = state.probingHashes.isNotEmpty()
-                    val probedVisibleCount = sortedResults.count { item ->
-                        val h = item.normalizedInfoHash
-                        h != null && h in state.probeResultsByHash
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = if (state.isScrapingSwarm) {
-                                "Verificando trackers en vivo…"
-                            } else {
-                                "${sortedResults.size} opciones · $probedVisibleCount probadas"
-                            },
-                            style = MaterialTheme.typography.labelMedium.tabular(),
-                            color = CinemaColors.TextSecondary,
-                        )
-                        TextButton(
-                            enabled = !isProbing,
-                            onClick = onDiagnoseTop,
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                        ) {
-                            Text(
-                                text = if (isProbing) "Probando swarm…" else "Diagnosticar Top 3",
-                                color = if (isProbing) CinemaColors.Gold else CinemaColors.Secondary,
-                            )
-                        }
-                    }
-                }
-            }
-            items(sortedResults, key = { it.id }) { res ->
+            items(displayResults, key = { it.id }) { res ->
                 val canInspect = res.description == null && !res.sourceRecordId.isNullOrBlank()
                 val inLibrary = isResultInLibrary(res, library)
                 TorrentReleaseCard(

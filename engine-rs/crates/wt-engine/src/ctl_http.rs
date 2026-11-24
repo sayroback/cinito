@@ -54,7 +54,12 @@ pub async fn serve(
 ) -> std::io::Result<Arc<ControlServer>> {
     let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], prefer_port))).await {
         Ok(l) => l,
-        Err(_) => TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?,
+        Err(err) => {
+            crate::jni::log_warn(&format!(
+                "control port {prefer_port} bind failed, using ephemeral port: {err}"
+            ));
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?
+        }
     };
     let port = listener.local_addr()?.port();
 
@@ -84,12 +89,18 @@ pub async fn serve(
                                 let service = service_fn(move |req| {
                                     handle_control(req, engine.clone(), done_tx.clone())
                                 });
-                                let _ = Builder::new(TokioExecutor::new())
+                                if let Err(err) = Builder::new(TokioExecutor::new())
                                     .serve_connection(io, service)
-                                    .await;
+                                    .await
+                                {
+                                    crate::jni::log_debug(&format!("control connection ended: {err}"));
+                                }
                             });
                         }
-                        Err(_) => break,
+                        Err(err) => {
+                            crate::jni::log_warn(&format!("control accept failed, server stopping: {err}"));
+                            break;
+                        }
                     }
                 }
             }
@@ -121,7 +132,8 @@ async fn handle_control(
 
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+        Err(err) => {
+            crate::jni::log_warn(&format!("control {method} {path}: body read failed: {err}"));
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 br#"{"error":"failed to read body"}"#,
@@ -143,7 +155,8 @@ async fn handle_control(
     .await
     {
         Ok(response) => response,
-        Err(_) => {
+        Err(err) => {
+            crate::jni::log_error(&format!("control request task failed: {err}"));
             return Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 br#"{"error":"control request failed"}"#,

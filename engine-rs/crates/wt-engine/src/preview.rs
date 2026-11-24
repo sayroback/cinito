@@ -107,6 +107,8 @@ pub struct PreviewReader {
     admitted_bytes: AtomicI64,
     close_hooks: Mutex<Vec<Box<dyn FnOnce() + Send + Sync>>>,
     admission: Mutex<Option<PreviewAdmission>>,
+    /// Who closed the reader (`close_with_reason`); reported in cancelled reads.
+    close_reason: Mutex<Option<&'static str>>,
 }
 
 impl PreviewReader {
@@ -131,6 +133,7 @@ impl PreviewReader {
             admitted_bytes: AtomicI64::new(0),
             close_hooks: Mutex::new(Vec::new()),
             admission: Mutex::new(None),
+            close_reason: Mutex::new(None),
         }
     }
 
@@ -229,11 +232,12 @@ impl PreviewReader {
                 }
             }
             let lock = self.inner_read.lock();
-            return lock
+            let read = lock
                 .as_ref()
                 .ok_or_else(|| std::io::Error::other("preview closed"))?(
                 &mut buf[..want], offset
             );
+            return read.map_err(|err| self.annotate_closed(err));
         }
 
         // Soft remaining-budget gate (matches Go errPreviewBudget on overshoot).
@@ -301,9 +305,15 @@ impl PreviewReader {
     }
 
     pub fn close(&self) {
+        self.close_with_reason("closed by caller");
+    }
+
+    /// Close and record who asked, so a cancelled read can say why.
+    pub fn close_with_reason(&self, reason: &'static str) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        *self.close_reason.lock() = Some(reason);
         let hooks = std::mem::take(&mut *self.close_hooks.lock());
         for hook in hooks {
             hook();
@@ -316,6 +326,22 @@ impl PreviewReader {
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+
+    pub fn close_reason(&self) -> Option<&'static str> {
+        *self.close_reason.lock()
+    }
+
+    /// Reads interrupted by a close name the closer in the error text.
+    fn annotate_closed(&self, err: std::io::Error) -> std::io::Error {
+        if err.kind() == std::io::ErrorKind::Interrupted && self.closed.load(Ordering::SeqCst) {
+            let reason = self.close_reason().unwrap_or("unspecified");
+            return std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("preview cancelled: {reason}"),
+            );
+        }
+        err
+    }
 }
 
 pub fn open_preview(
@@ -325,7 +351,7 @@ pub fn open_preview(
 ) -> std::io::Result<Arc<PreviewReader>> {
     let mut active = server.preview_active.lock();
     if let Some(prev) = active.take() {
-        prev.close();
+        prev.close_with_reason("superseded by open_preview");
     }
 
     let records = server.records.read();
@@ -483,7 +509,11 @@ pub fn open_preview(
         Ok(n)
     });
 
-    let piece_length = rec.torrent.info().unwrap().piece_length;
+    let piece_length = rec
+        .torrent
+        .info()
+        .map(|info| info.piece_length)
+        .ok_or_else(|| std::io::Error::other("metadata not ready"))?;
     let effective_budget = PREVIEW_BUDGET_BYTES
         .max(piece_length.saturating_mul(6))
         .max(32 * 1024 * 1024);
@@ -514,6 +544,10 @@ pub fn open_preview(
     let cancel_hook = cancel_token;
 
     reader.add_close_hook(move || {
+        let reason = reader_weak.upgrade().and_then(|r| r.close_reason()).unwrap_or("unspecified");
+        crate::jni::log_info(&format!(
+            "preview closed id={id_hook} index={index} temp={is_temp} reason={reason}"
+        ));
         cancel_hook.cancel();
         torrent_hook.bump_change();
         coordinator_hook.set_preview_demand(HashMap::new());
@@ -560,7 +594,7 @@ pub fn open_preview(
     std::thread::spawn(move || {
         std::thread::sleep(PREVIEW_SESSION_TIMEOUT);
         if let Some(r) = weak_exp.upgrade() {
-            r.close();
+            r.close_with_reason("session timeout");
         }
     });
 

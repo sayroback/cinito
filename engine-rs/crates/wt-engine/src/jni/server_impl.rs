@@ -16,7 +16,7 @@ use crate::preview::PreviewReader;
 use crate::server::EngineServer;
 
 use super::host_api::EngineHostApi;
-use super::{log_error, log_info};
+use super::{log_error, log_info, log_warn};
 
 /// Android/JNI host wrapping a single [`EngineServer`].
 pub struct AndroidEngineHost {
@@ -113,6 +113,7 @@ impl EngineHostApi for AndroidEngineHost {
 
     fn request_engine(&self, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
         let Some(server) = self.current_server() else {
+            log_warn(&format!("request {method} {path}: server not ready, returning 503"));
             return b"503\n{\"error\":\"engine is starting\"}".to_vec();
         };
         let (status, response) = server.dispatch_control_bytes(method, path, body);
@@ -143,7 +144,7 @@ impl EngineHostApi for AndroidEngineHost {
         let reader = match server.open_playback(id, file_index as usize) {
             Ok(reader) => reader,
             Err(err) => {
-                log_error(&format!("open playback: {err}"));
+                log_error(&format!("open playback id={id} index={file_index}: {err}"));
                 return 0;
             }
         };
@@ -154,7 +155,10 @@ impl EngineHostApi for AndroidEngineHost {
             .find_map(|(&handle, candidate)| Arc::ptr_eq(candidate, &reader).then_some(handle))
         {
             Some(handle) => handle,
-            None => return 0,
+            None => {
+                log_error(&format!("open playback id={id} index={file_index}: reader not registered"));
+                return 0;
+            }
         };
         self.playback.lock().insert(handle, reader);
         handle
@@ -168,7 +172,10 @@ impl EngineHostApi for AndroidEngineHost {
             let map = self.playback.lock();
             match map.get(&handle) {
                 Some(reader) => reader.clone(),
-                None => return -1,
+                None => {
+                    log_warn(&format!("playback read handle={handle}: unknown handle"));
+                    return -1;
+                }
             }
         };
         // ProxyFileDescriptorCallback must return the exact size asked for unless
@@ -178,7 +185,7 @@ impl EngineHostApi for AndroidEngineHost {
         match reader.read_at(buf, offset) {
             Ok(n) => n as i32,
             Err(err) => {
-                log_error(&format!("playback read: {err}"));
+                log_error(&format!("playback read handle={handle} offset={offset}: {err}"));
                 -1
             }
         }
@@ -207,7 +214,7 @@ impl EngineHostApi for AndroidEngineHost {
         let reader = match server.open_preview(id, file_index as usize) {
             Ok(reader) => reader,
             Err(err) => {
-                log_error(&format!("open preview: {err}"));
+                log_error(&format!("open preview id={id} index={file_index}: {err}"));
                 return 0;
             }
         };
@@ -218,7 +225,10 @@ impl EngineHostApi for AndroidEngineHost {
             .find_map(|(&handle, candidate)| Arc::ptr_eq(candidate, &reader).then_some(handle))
         {
             Some(handle) => handle,
-            None => return 0,
+            None => {
+                log_error(&format!("open preview id={id} index={file_index}: reader not registered"));
+                return 0;
+            }
         };
         self.preview.lock().insert(handle, reader);
         handle
@@ -232,7 +242,10 @@ impl EngineHostApi for AndroidEngineHost {
             let map = self.preview.lock();
             match map.get(&handle) {
                 Some(reader) => reader.clone(),
-                None => return -1,
+                None => {
+                    log_warn(&format!("preview read handle={handle}: unknown handle"));
+                    return -1;
+                }
             }
         };
         match reader.read_at(buf, offset) {
@@ -244,7 +257,10 @@ impl EngineHostApi for AndroidEngineHost {
                 }
             }
             Err(err) => {
-                log_error(&format!("preview read: {err}"));
+                log_error(&format!(
+                    "preview read handle={handle} index={} offset={offset}: {err}",
+                    reader.file_index
+                ));
                 -1
             }
         }
@@ -253,12 +269,12 @@ impl EngineHostApi for AndroidEngineHost {
     fn close_preview(&self, handle: i64) {
         let reader = self.preview.lock().remove(&handle);
         if let Some(reader) = reader {
-            reader.close();
+            reader.close_with_reason("closed by host (closePreview)");
         }
         if let Some(server) = self.current_server() {
             let reader = server.preview_readers.lock().remove(&handle);
             if let Some(reader) = reader {
-                reader.close();
+                reader.close_with_reason("closed by host (closePreview)");
             }
         }
     }

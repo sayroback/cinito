@@ -45,6 +45,7 @@ class TorznabXmlParser(
         val category = when (catCode) {
             in 2000..2999 -> SearchCategory.Movies
             in 5000..5999 -> if (catCode == 5070) SearchCategory.Anime else SearchCategory.Series
+            in 6000..6999 -> SearchCategory.Adult
             else -> SearchCategory.Other
         }
 

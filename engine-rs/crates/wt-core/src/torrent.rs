@@ -536,6 +536,16 @@ impl TorrentInner {
     }
 
     pub fn add_peers(&self, peers: Vec<PeerInfo>) -> usize {
+        let incoming = peers.len();
+        let mut by_src = std::collections::BTreeMap::<String, usize>::new();
+        for p in &peers {
+            *by_src.entry(format!("{:?}", p.source)).or_default() += 1;
+        }
+        let src = by_src
+            .iter()
+            .map(|(s, n)| format!("{s}:{n}"))
+            .collect::<Vec<_>>()
+            .join("/");
         let high_water = self
             .client
             .read()
@@ -571,6 +581,15 @@ impl TorrentInner {
                     .collect()
             }
         };
+        if peers.len() < incoming {
+            log::debug!(
+                target: "webtor-engine",
+                "add_peers hash={} cooling_skip={}",
+                &self.info_hash.to_hex()[..8],
+                incoming - peers.len(),
+            );
+        }
+        let mut trimmed = 0usize;
         let mut added = Vec::new();
         {
             let mut known = self.known_peers.write();
@@ -621,12 +640,19 @@ impl TorrentInner {
                 match victim {
                     Some(p) => {
                         known.remove(&p);
+                        trimmed += 1;
                     }
                     None => break,
                 }
             }
         }
         let count = added.len();
+        log::info!(
+            target: "webtor-engine",
+            "add_peers hash={} src={src} in={incoming} added={count} trimmed={trimmed} known={}",
+            &self.info_hash.to_hex()[..8],
+            self.known_peers.read().len(),
+        );
         if count > 0 {
             self.peer_notify.notify_one();
         }
@@ -639,9 +665,11 @@ impl TorrentInner {
         handle: crate::conn::ConnHandle,
     ) -> Result<crate::peer_conn::PeerConnHandler<Self>> {
         if self.closed.load(Ordering::Relaxed) {
+            log::debug!(target: "webtor-engine", "attach_reject hash={} addr={} reason=closed", &self.info_hash.to_hex()[..8], info.remote);
             return Err(CoreError::Closed);
         }
         if info.remote != handle.remote_addr() {
+            log::warn!(target: "webtor-engine", "attach_reject hash={} addr={} reason=addr_mismatch", &self.info_hash.to_hex()[..8], info.remote);
             return Err(CoreError::Other("peer address mismatch".into()));
         }
         let _ = (
@@ -660,6 +688,7 @@ impl TorrentInner {
                 || (has_id && handles.values().any(|h| !h.is_closed() && h.peer_id() == Some(peer_id)))
         };
         if duplicate(&self.conn_handles.read()) {
+            log::debug!(target: "webtor-engine", "attach_reject hash={} addr={} reason=duplicate", &self.info_hash.to_hex()[..8], info.remote);
             return Err(CoreError::Other("duplicate peer".into()));
         }
         let max = self.conn_limit();
@@ -676,16 +705,19 @@ impl TorrentInner {
             let incoming_is_bad = (incoming.saturating_sub(outgoing) > 1) && info.outgoing;
             let outgoing_is_bad = (outgoing.saturating_sub(incoming) > 1) && !info.outgoing;
             let Some(victim) = self.worst_bad_conn_addr(incoming_is_bad, outgoing_is_bad) else {
+                log::debug!(target: "webtor-engine", "attach_reject hash={} addr={} reason=full", &self.info_hash.to_hex()[..8], info.remote);
                 return Err(CoreError::Other("don't want conn".into()));
             };
             self.drop_conn_addr(victim, "replaced by better peer");
         }
         let mut handles = self.conn_handles.write();
         if duplicate(&handles) {
+            log::debug!(target: "webtor-engine", "attach_reject hash={} addr={} reason=duplicate", &self.info_hash.to_hex()[..8], info.remote);
             return Err(CoreError::Other("duplicate peer".into()));
         }
         if handles.len() >= max {
             // Race: another attach won the slot.
+            log::debug!(target: "webtor-engine", "attach_reject hash={} addr={} reason=race_full", &self.info_hash.to_hex()[..8], info.remote);
             return Err(CoreError::Other("don't want conn".into()));
         }
         handles.insert(info.remote, handle.clone());
@@ -695,6 +727,16 @@ impl TorrentInner {
         self.start_hashing();
         let mut handler = crate::peer_conn::PeerConnHandler::new(Arc::clone(self), &handle);
         handler.start(&handle);
+        log::info!(
+            target: "webtor-engine",
+            "peer_up hash={} addr={} out={} src={:?} enc={} conns={}",
+            &self.info_hash.to_hex()[..8],
+            info.remote,
+            info.outgoing,
+            info.source,
+            info.encrypted,
+            self.conn_handles.read().len(),
+        );
         self.bump_change();
         Ok(handler)
     }
@@ -734,10 +776,19 @@ impl TorrentInner {
             return;
         }
         let ps = storage.piece(info.piece(piece), info.piece_hash_v1(piece));
-        let valid = result.correct
-            && !result.cancelled
-            && result.error.is_none()
-            && ps.mark_complete().is_ok();
+        let verified = result.correct && !result.cancelled && result.error.is_none();
+        let valid = verified
+            && match ps.mark_complete() {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!(
+                        target: "webtor-engine",
+                        "piece_complete_fail hash={} piece={piece} err={e}",
+                        &self.info_hash.to_hex()[..8],
+                    );
+                    false
+                }
+            };
         // Leaf hashes only serve a piece in progress.
         if valid {
             self.leaf_layers.write().remove(&piece);
@@ -745,8 +796,22 @@ impl TorrentInner {
         }
         if valid {
             self.failed_pieces.lock().remove(&piece);
+            log::debug!(target: "webtor-engine", "piece_ok hash={} piece={piece}", &self.info_hash.to_hex()[..8]);
         } else {
-            let _ = ps.mark_not_complete();
+            if let Err(e) = ps.mark_not_complete() {
+                log::warn!(target: "webtor-engine", "piece_unmark_fail hash={} piece={piece} err={e}", &self.info_hash.to_hex()[..8]);
+            }
+            if result.cancelled {
+                log::debug!(target: "webtor-engine", "piece_cancelled hash={} piece={piece}", &self.info_hash.to_hex()[..8]);
+            } else {
+                log::warn!(
+                    target: "webtor-engine",
+                    "piece_hash_fail hash={} piece={piece} correct={} err={:?}",
+                    &self.info_hash.to_hex()[..8],
+                    result.correct,
+                    result.error,
+                );
+            }
             self.failed_pieces.lock().insert(piece);
             self.hash_fail_generation.fetch_add(1, Ordering::Relaxed);
             wt_types::events::record("hash_fail", format!("piece={piece}"));
@@ -1020,6 +1085,12 @@ impl TorrentInner {
     /// Frees the established slot immediately; records the close reason.
     pub(crate) fn drop_conn_addr(&self, addr: SocketAddr, reason: &str) {
         if let Some(handle) = self.retire_connection(addr) {
+            log::info!(
+                target: "webtor-engine",
+                "peer_drop hash={} addr={addr} out={} reason={reason}",
+                &self.info_hash.to_hex()[..8],
+                handle.is_outgoing(),
+            );
             handle.close(reason);
             *self
                 .swarm_diagnostics
@@ -1070,17 +1141,40 @@ impl TorrentInner {
         if max == 0 {
             return Vec::new();
         }
+        let out = self.take_dial_candidates_inner(max);
+        if !out.is_empty() {
+            log::info!(
+                target: "webtor-engine",
+                "dial batch hash={} requested={max} got={}",
+                &self.info_hash.to_hex()[..8],
+                out.len(),
+            );
+        }
+        out
+    }
+
+    fn take_dial_candidates_inner(&self, max: usize) -> Vec<PeerInfo> {
         // Go prioritizedPeers.PopMax is trust then BEP 40. Pure Pop without
         // rediscovery drains the pool faster than tracker/DHT refill on Ubuntu
         // (pool 220→<40, dialFailures.timeout≈400). Failed dials are re-queued
         // with exp backoff; among ready peers prefer lower fail_counts so
         // recirculated dead contacts do not starve never-tried addrs.
         let now = Instant::now();
+        let pool_stats: (usize, usize, usize, usize);
         let mut eligible: Vec<PeerInfo> = {
             let handles = self.conn_handles.read();
             let dialing = self.dialing_peers.lock();
             let backoff = self.dial_backoff.lock();
             let known = self.known_peers.read();
+            pool_stats = (
+                known.len(),
+                known.iter().filter(|p| handles.contains_key(&p.addr)).count(),
+                known.iter().filter(|p| dialing.contains(&p.addr)).count(),
+                known
+                    .iter()
+                    .filter(|p| backoff.get(&p.addr).is_some_and(|until| *until > now))
+                    .count(),
+            );
             let mut seen = HashSet::new();
             // The same endpoint can arrive from tracker, DHT and PEX. Go checks
             // connectingToPeerAddr before starting each attempt; reserve it once.
@@ -1095,6 +1189,15 @@ impl TorrentInner {
                 .cloned()
                 .collect()
         };
+        if eligible.len() < max {
+            let (pool_known, pool_connected, pool_dialing, pool_backoff) = pool_stats;
+            log::info!(
+                target: "webtor-engine",
+                "dial pool hash={} requested={max} eligible={} known={pool_known} connected={pool_connected} dialing={pool_dialing} backoff={pool_backoff}",
+                &self.info_hash.to_hex()[..8],
+                eligible.len(),
+            );
+        }
         // Sort with no peer table locked: the pool can hold hundreds.
         let fail_counts = self.dial_fail_counts.lock().clone();
         // Smoothed connect rate per thousand, so an untried source starts even.
@@ -1115,8 +1218,22 @@ impl TorrentInner {
         });
         eligible.truncate(max);
         let taken: HashSet<SocketAddr> = eligible.iter().map(|p| p.addr).collect();
-        self.known_peers.write().retain(|p| !taken.contains(&p.addr));
-        self.dialing_peers.lock().extend(taken);
+        let taken_n = taken.len();
+        let known_left = {
+            let mut known = self.known_peers.write();
+            known.retain(|p| !taken.contains(&p.addr));
+            known.len()
+        };
+        let dialing_n = {
+            let mut dialing = self.dialing_peers.lock();
+            dialing.extend(taken);
+            dialing.len()
+        };
+        log::debug!(
+            target: "webtor-engine",
+            "dial_take hash={} n={taken_n} known={known_left} dialing={dialing_n}",
+            &self.info_hash.to_hex()[..8],
+        );
         eligible
     }
 
@@ -1147,13 +1264,33 @@ impl TorrentInner {
     /// backoff from dials that failed because there was no route.
     pub(crate) fn route_changed(&self) {
         self.route_epoch.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-        self.dial_backoff.lock().clear();
-        self.dial_fail_counts.lock().clear();
+        let backoff_n = {
+            let mut backoff = self.dial_backoff.lock();
+            let n = backoff.len();
+            backoff.clear();
+            n
+        };
+        let fails_n = {
+            let mut counts = self.dial_fail_counts.lock();
+            let n = counts.len();
+            counts.clear();
+            n
+        };
+        log::info!(
+            target: "webtor-engine",
+            "route_changed hash={} backoff_cleared={backoff_n} fails_cleared={fails_n}",
+            &self.info_hash.to_hex()[..8],
+        );
         self.peer_notify.notify_one();
     }
 
     pub(crate) fn dial_finished(&self, addr: SocketAddr, ok: bool) {
-        self.dialing_peers.lock().remove(&addr);
+        let was_dialing = self.dialing_peers.lock().remove(&addr);
+        log::debug!(
+            target: "webtor-engine",
+            "dial_end hash={} addr={addr} ok={ok} was_dialing={was_dialing}",
+            &self.info_hash.to_hex()[..8],
+        );
         if ok {
             // Handshake success alone must NOT clear fail_count/backoff.
             // Bunny retain runs: dial_ok cleared the penalty, then unhelpful RST
@@ -1168,9 +1305,16 @@ impl TorrentInner {
                 *e = e.saturating_add(1);
                 *e
             };
+            let wait = dial_backoff_after(n);
             self.dial_backoff
                 .lock()
-                .insert(addr, Instant::now() + dial_backoff_after(n));
+                .insert(addr, Instant::now() + wait);
+            log::debug!(
+                target: "webtor-engine",
+                "dial_backoff hash={} addr={addr} fails={n} wait_ms={}",
+                &self.info_hash.to_hex()[..8],
+                wait.as_millis(),
+            );
             self.prune_dial_penalties();
         }
         // Only the dialer cares; waking every peer per failed dial is a herd.
@@ -1179,6 +1323,7 @@ impl TorrentInner {
 
     /// Settle a dial that did not end in plain success or failure.
     pub(crate) fn dial_settled(&self, peer: &PeerInfo, verdict: DialVerdict) {
+        log::info!(target: "webtor-engine", "dial hash={} addr={} verdict={verdict:?}", &self.info_hash.to_hex()[..8], peer.addr);
         match verdict {
             DialVerdict::Connected => return self.dial_finished(peer.addr, true),
             DialVerdict::Unreachable => return self.dial_finished(peer.addr, false),
@@ -1202,6 +1347,12 @@ impl TorrentInner {
         let mut backoff = self.dial_backoff.lock();
         let entry = backoff.entry(addr).or_insert(until);
         *entry = (*entry).max(until);
+        log::debug!(
+            target: "webtor-engine",
+            "dial_cooldown hash={} addr={addr} wait_ms={}",
+            &self.info_hash.to_hex()[..8],
+            wait.as_millis(),
+        );
     }
 
     /// Forget penalties long past their cooldown, so a long session's DHT
@@ -1214,7 +1365,14 @@ impl TorrentInner {
             if backoff.len() <= DIAL_PENALTY_SOFT_CAP {
                 return;
             }
+            let before = backoff.len();
             backoff.retain(|_, until| *until + DIAL_PENALTY_FORGET_AFTER > now);
+            log::debug!(
+                target: "webtor-engine",
+                "dial_penalty_prune hash={} backoff={before}->{}",
+                &self.info_hash.to_hex()[..8],
+                backoff.len(),
+            );
             backoff.keys().copied().collect()
         };
         self.dial_fail_counts.lock().retain(|addr, _| kept.contains(addr));
@@ -1222,8 +1380,15 @@ impl TorrentInner {
 
     /// Wipe dial fail/backoff after the peer proves helpful (useful chunk).
     pub(crate) fn clear_dial_penalty(&self, addr: SocketAddr) {
-        self.dial_backoff.lock().remove(&addr);
-        self.dial_fail_counts.lock().remove(&addr);
+        let was_backoff = self.dial_backoff.lock().remove(&addr).is_some();
+        let was_fails = self.dial_fail_counts.lock().remove(&addr).is_some();
+        if was_backoff || was_fails {
+            log::debug!(
+                target: "webtor-engine",
+                "dial_penalty_clear hash={} addr={addr}",
+                &self.info_hash.to_hex()[..8],
+            );
+        }
     }
 
     /// Post-handshake close that never delivered useful data must count like a

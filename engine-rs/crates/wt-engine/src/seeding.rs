@@ -50,21 +50,35 @@ impl SeedingManager {
         use std::os::unix::fs::OpenOptionsExt;
         let _serial = self.save_lock.lock();
         let bytes = serde_json::to_vec(&*self.accounts.lock());
-        if let Ok(bytes) = bytes {
-            let tmp = self.path.with_extension("tmp");
-            let result = (|| -> std::io::Result<()> {
-                let mut file = fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&tmp)?;
-                file.write_all(&bytes)?;
-                fs::rename(&tmp, &self.path)
-            })();
-            if result.is_err() {
-                let _ = fs::remove_file(tmp);
+        match bytes {
+            Ok(bytes) => {
+                let tmp = self.path.with_extension("tmp");
+                let result = (|| -> std::io::Result<()> {
+                    let mut file = fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .mode(0o600)
+                        .open(&tmp)?;
+                    file.write_all(&bytes)?;
+                    fs::rename(&tmp, &self.path)
+                })();
+                if let Err(err) = result {
+                    crate::jni::log_warn(&format!(
+                        "seeding accounts save failed path={}: {err}",
+                        self.path.display()
+                    ));
+                    if let Err(err) = fs::remove_file(&tmp) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            crate::jni::log_warn(&format!(
+                                "seeding accounts tmp cleanup failed path={}: {err}",
+                                tmp.display()
+                            ));
+                        }
+                    }
+                }
             }
+            Err(err) => crate::jni::log_error(&format!("seeding accounts serialize failed: {err}")),
         }
     }
 }

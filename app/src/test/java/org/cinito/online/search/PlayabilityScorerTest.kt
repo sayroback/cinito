@@ -215,4 +215,129 @@ class PlayabilityScorerTest {
         assertNotNull(eval.probe)
         assertTrue(eval.reasons.any { it.contains("Ya en biblioteca") })
     }
+
+    @Test
+    fun nonVideoPacksArePenalizedBelowPlayableVideosAndHighSeedIgnoresLeecherSpike() {
+        val videoRelease = SearchUtils.makeResult(
+            providerId = "solidtorrents",
+            providerName = "SolidTorrents",
+            title = "Studio.Sample.2026.1080p.mp4",
+            magnetUri = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            sizeBytes = 1_200_000_000L,
+            seeders = 250,
+            peers = 9_000,
+        )
+        val photoPack = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Model.Photoset.2026.Gallery.zip",
+            magnetUri = "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            sizeBytes = 400_000_000L,
+            seeders = 300,
+            peers = 10,
+        )
+
+        val videoEval = PlayabilityScorer.evaluate(videoRelease)
+        val packEval = PlayabilityScorer.evaluate(photoPack)
+
+        assertEquals(PlayabilityVerdict.Optimal, videoEval.verdict)
+        assertEquals(PlayabilityVerdict.Risky, packEval.verdict)
+        assertTrue(videoEval.score > packEval.score)
+        assertTrue(packEval.reasons.any { it.contains("Pack de imágenes", ignoreCase = true) })
+    }
+
+    @Test
+    fun liveScrapedTorrentOutranksUnverifiedStaleSolidTorrentsCache() {
+        val liveItem = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Movie.2025.1080p.WEB-DL.H264",
+            magnetUri = "magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678",
+            sizeBytes = 2L * 1024L * 1024L * 1024L,
+            seeders = 191,
+            peers = 12,
+            category = SearchCategory.Movies,
+        )
+        val staleSolidTorrents = SearchUtils.makeResult(
+            providerId = "solidtorrents",
+            providerName = "SolidTorrents",
+            title = "Movie.2025.1080p.WEB-DL.H264",
+            magnetUri = "magnet:?xt=urn:btih:fedcba0987654321fedcba0987654321fedcba09",
+            sizeBytes = 2L * 1024L * 1024L * 1024L,
+            seeders = 304,
+            peers = 12,
+            category = SearchCategory.Movies,
+        )
+        val midSeedUnprobed = SearchUtils.makeResult(
+            providerId = "yts",
+            providerName = "YTS",
+            title = "Movie.2025.1080p.WEB-DL.H264",
+            magnetUri = "magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12",
+            sizeBytes = 2L * 1024L * 1024L * 1024L,
+            seeders = 15,
+            peers = 4,
+            category = SearchCategory.Movies,
+        )
+
+        val liveEval = PlayabilityScorer.evaluate(
+            liveItem,
+            PlayabilityContext(),
+            scrape = TrackerSwarmStats(seeders = 191, leechers = 12),
+        )
+        val staleEval = PlayabilityScorer.evaluate(staleSolidTorrents, PlayabilityContext())
+        val midSeedEval = PlayabilityScorer.evaluate(midSeedUnprobed, PlayabilityContext())
+
+        assertTrue(liveEval.isLiveScraped)
+        assertTrue(liveEval.score > staleEval.score)
+        assertEquals(PlayabilityVerdict.Good, midSeedEval.verdict)
+    }
+
+    @Test
+    fun probeConfirmedDeadMarksDeadEvenWithTrackerSeedsUnlessPolicyBlocked() {
+        val hash = "9999999999999999999999999999999999999999"
+        val result = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Movie.2025.1080p.WEB-DL",
+            magnetUri = "magnet:?xt=urn:btih:$hash",
+            sizeBytes = 2L * 1024L * 1024L * 1024L,
+            seeders = 20,
+            peers = 4,
+            category = SearchCategory.Movies,
+        )
+
+        val deadProbe = SwarmProbeResult(
+            infoHash = hash,
+            ttfmMs = 0L,
+            measuredDownloadBps = 0L,
+            activePeers = 0,
+            connectedSeeders = 0,
+            isPolicyBlocked = false,
+        )
+        val deadEval = PlayabilityScorer.evaluate(result, PlayabilityContext(), probe = deadProbe)
+        assertEquals(PlayabilityVerdict.Dead, deadEval.verdict)
+        assertEquals(1, deadEval.score)
+
+        val connectedHeaderOnlyProbe = deadProbe.copy(
+            activePeers = 3,
+            targetFileSizeBytes = 1_500_000_000L,
+        )
+        val headerEval = PlayabilityScorer.evaluate(result, PlayabilityContext(), probe = connectedHeaderOnlyProbe)
+        assertTrue("Probe with connected peers/resolved file must not be marked Dead", headerEval.verdict != PlayabilityVerdict.Dead)
+
+        val policyBlockedProbe = deadProbe.copy(isPolicyBlocked = true)
+        val blockedEval = PlayabilityScorer.evaluate(result, PlayabilityContext(), probe = policyBlockedProbe)
+        assertTrue(blockedEval.verdict != PlayabilityVerdict.Dead)
+    }
+
+    @Test
+    fun estimateVideoRequiredMbpsComputesExpectedBitrateByCategory() {
+        val twoGb = 2_000_000_000L
+        val movieMbps = PlayabilityScorer.estimateVideoRequiredMbps(twoGb, SearchCategory.Movies)
+        val animeMbps = PlayabilityScorer.estimateVideoRequiredMbps(twoGb, SearchCategory.Anime)
+        assertNotNull(movieMbps)
+        assertNotNull(animeMbps)
+        assertTrue(animeMbps!! > movieMbps!!)
+        assertNull(PlayabilityScorer.estimateVideoRequiredMbps(0L))
+    }
 }

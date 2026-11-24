@@ -3680,6 +3680,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "hex",
+ "log",
  "mainline",
  "parking_lot",
  "rand 0.8.8",
@@ -3708,6 +3709,7 @@ dependencies = [
  "futures",
  "hex",
  "http",
+ "log",
  "mainline",
  "parking_lot",
  "rand 0.8.8",
