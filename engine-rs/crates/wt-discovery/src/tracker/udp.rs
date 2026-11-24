@@ -108,22 +108,41 @@ impl UdpClient {
         }
         // `self.host` is already `host:port` (or `[v6]:port`) from the URL parser.
         let host = self.host.clone();
-        let candidates: Vec<SocketAddr> = tokio::net::lookup_host(&host)
-            .await
-            .map_err(|e| TrackerError::Other(format!("resolve {host}: {e}")))?
-            .collect();
+        let started = Instant::now();
+        let lookup = tokio::net::lookup_host(&host).await;
+        let dns_ms = started.elapsed().as_millis();
+        let candidates: Vec<SocketAddr> = match lookup {
+            Ok(addrs) => {
+                let v: Vec<SocketAddr> = addrs.collect();
+                log::info!(target: "webtor-engine", "udp dns host={host} ok addrs={} ms={dns_ms}", v.len());
+                v
+            }
+            Err(e) => {
+                log::warn!(target: "webtor-engine", "udp dns host={host} err={e:?} ms={dns_ms}");
+                return Err(TrackerError::Other(format!("resolve {host}: {e}")));
+            }
+        };
         if candidates.is_empty() {
+            log::warn!(target: "webtor-engine", "udp dns host={host} no addresses");
             return Err(TrackerError::Other(format!("no addresses for {host}")));
         }
         // Shared datagram IO is typically IPv4-only (the first dual-stack uTP
         // socket). Sending to an IPv6 AAAA result yields EAFNOSUPPORT (97).
         let local = self.io.local_addr().map_err(TrackerError::Io)?;
-        let addr = select_remote_for_local(local, &candidates).ok_or_else(|| {
-            TrackerError::Other(format!(
-                "no {} addresses for {host} (local {local})",
-                if local.is_ipv6() { "IPv6" } else { "IPv4" }
-            ))
-        })?;
+        let addr = match select_remote_for_local(local, &candidates) {
+            Some(a) => a,
+            None => {
+                log::warn!(
+                    target: "webtor-engine",
+                    "udp dns host={host} no family match local={local} candidates={candidates:?}"
+                );
+                return Err(TrackerError::Other(format!(
+                    "no {} addresses for {host} (local {local})",
+                    if local.is_ipv6() { "IPv6" } else { "IPv4" }
+                )));
+            }
+        };
+        log::debug!(target: "webtor-engine", "udp remote host={host} addr={addr} local={local}");
         *self.remote.lock() = Some(addr);
         Ok(addr)
     }
@@ -154,6 +173,7 @@ impl UdpClient {
         let mut st = self.state.lock();
         st.conn_id = conn_id;
         st.issued = Some(Instant::now());
+        log::debug!(target: "webtor-engine", "udp connect ok host={} conn_id={conn_id:016x}", self.host);
         Ok(conn_id)
     }
 
@@ -169,6 +189,7 @@ impl UdpClient {
 
         loop {
             if Instant::now() >= deadline {
+                log::warn!(target: "webtor-engine", "udp tracker timeout remote={addr} attempt={attempt} overall_ms={}", self.overall_timeout.as_millis());
                 return Err(TrackerError::Timeout);
             }
             self.io
@@ -177,10 +198,12 @@ impl UdpClient {
                 .map_err(TrackerError::Io)?;
 
             let wait = udp_timeout(attempt).min(deadline.saturating_duration_since(Instant::now()));
+            log::debug!(target: "webtor-engine", "udp send remote={addr} attempt={attempt} timeout_ms={} bytes={}", wait.as_millis(), packet.len());
             let mut buf = [0u8; 2048];
             match timeout(wait, self.io.recv_from(&mut buf)).await {
                 Ok(Ok((n, from))) => {
                     if from != addr {
+                        log::debug!(target: "webtor-engine", "udp ignored packet from={from} expected={addr}");
                         continue;
                     }
                     if n < 8 {
@@ -189,6 +212,7 @@ impl UdpClient {
                     let action = i32::from_be_bytes(buf[0..4].try_into().unwrap());
                     let tid = i32::from_be_bytes(buf[4..8].try_into().unwrap());
                     if tid != expect_tid {
+                        log::debug!(target: "webtor-engine", "udp ignored packet tid mismatch remote={addr} got={tid} want={expect_tid}");
                         continue;
                     }
                     if action == ACTION_ERROR {
@@ -199,8 +223,10 @@ impl UdpClient {
                 }
                 Ok(Err(e)) => return Err(TrackerError::Io(e)),
                 Err(_) => {
+                    log::debug!(target: "webtor-engine", "udp no reply remote={addr} attempt={attempt} waited_ms={}", wait.as_millis());
                     attempt += 1;
                     if Instant::now() >= deadline {
+                        log::warn!(target: "webtor-engine", "udp tracker gave up remote={addr} next_attempt={attempt} overall_ms={}", self.overall_timeout.as_millis());
                         return Err(TrackerError::Timeout);
                     }
                     // Retry with doubled timeout like Go.

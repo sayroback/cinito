@@ -169,6 +169,7 @@ impl PeerTorrent for TorrentInner {
             if self.pieces.read().get(piece).is_some_and(|p| !p.partial) {
                 if let Some(entry) = self.pieces_mut().get_mut(piece) {
                     entry.partial = true;
+                    log::debug!(target: "webtor-engine", "piece_first_block hash={} piece={piece}", &self.info_hash.to_hex()[..8]);
                 }
             }
         }
@@ -366,6 +367,13 @@ impl PeerTorrent for TorrentInner {
             wt_types::events::record("peer_closed", format!(
                 "kind={} useful={useful_bytes} out={}",
                 crate::stats::failure_kind(&reason), handle.is_outgoing()));
+            log::info!(
+                target: "webtor-engine",
+                "peer_closed hash={} addr={addr} out={} kind={} useful={useful_bytes} reason={reason}",
+                &self.info_hash.to_hex()[..8],
+                handle.is_outgoing(),
+                crate::stats::failure_kind(&reason),
+            );
             #[cfg(not(target_os = "android"))]
             eprintln!(
                 "peer_closed addr={} out={} src={:?} reason={}",
@@ -389,6 +397,11 @@ impl PeerTorrent for TorrentInner {
                 && !self.closed.load(Ordering::Relaxed)
             {
                 self.dial_backoff.lock().insert(addr, Instant::now() + Duration::from_secs(5));
+                log::debug!(
+                    target: "webtor-engine",
+                    "redial_queued hash={} addr={addr} wait_ms=5000",
+                    &self.info_hash.to_hex()[..8],
+                );
                 self.add_peers(vec![wt_types::PeerInfo {
                     id: handle.peer_id(),
                     addr,
@@ -407,6 +420,13 @@ impl PeerTorrent for TorrentInner {
 
     fn update_peer_snapshot(&self, info: crate::stats::PeerConnInfo) {
         if info.peer_choking != self.choked_since.read().contains_key(&info.remote_addr) {
+            log::info!(
+                target: "webtor-engine",
+                "peer choke hash={} addr={} choking={}",
+                &self.info_hash.to_hex()[..8],
+                info.remote_addr,
+                info.peer_choking,
+            );
             let mut since = self.choked_since.write();
             if info.peer_choking {
                 since.entry(info.remote_addr).or_insert_with(Instant::now);
@@ -504,12 +524,24 @@ impl PeerTorrent for TorrentInner {
             smartban: None,
             seq: self.hash_seq.fetch_add(1, Ordering::Relaxed),
         };
-        if !self
-            .hasher
-            .lock()
-            .as_ref()
-            .is_some_and(|pool| pool.queue(job).is_ok())
-        {
+        let queued = match self.hasher.lock().as_ref() {
+            Some(pool) => match pool.queue(job) {
+                Ok(()) => true,
+                Err(err) => {
+                    log::warn!(
+                        target: "webtor-engine",
+                        "hash_queue_fail hash={} piece={piece} err={err}",
+                        &self.info_hash.to_hex()[..8],
+                    );
+                    false
+                }
+            },
+            None => {
+                log::debug!(target: "webtor-engine", "hash_queue_no_pool hash={} piece={piece}", &self.info_hash.to_hex()[..8]);
+                false
+            }
+        };
+        if !queued {
             if let Some(p) = self.pieces_mut().get_mut(piece as usize) {
                 p.checking = false;
             }
@@ -597,10 +629,12 @@ impl PeerTorrent for TorrentInner {
 
     fn record_rescue(&self) {
         self.rescues.fetch_add(1, Ordering::Relaxed);
+        log::debug!(target: "webtor-engine", "rescue hash={}", &self.info_hash.to_hex()[..8]);
     }
 
     fn record_hedge(&self) {
         self.hedges_sent.fetch_add(1, Ordering::Relaxed);
+        log::debug!(target: "webtor-engine", "hedge hash={}", &self.info_hash.to_hex()[..8]);
     }
 
 
@@ -636,8 +670,8 @@ impl PeerTorrent for TorrentInner {
             });
             // BEP 52: a btih magnet that turns out to be a hybrid now knows
             // its v2 hash: join the v2 swarm too.
-            if is_v2 && self.info_hash_v2().is_none() {
-                self.adopt_v2_key(verified.info_hash_v2);
+            if is_v2 && self.info_hash_v2().is_none() && !self.adopt_v2_key(verified.info_hash_v2) {
+                log::warn!(target: "webtor-engine", "v2_key_adopt_fail hash={}", &self.info_hash.to_hex()[..8]);
             }
             return Ok(true);
         }
@@ -759,10 +793,14 @@ impl PeerTorrent for TorrentInner {
             Ok(peers) => peers,
             // Soft discard: torrent-wide rest and per-conn spacing must not
             // close the peerconn (was mass-dropping Ubuntu peers).
-            Err(
-                crate::pex::PexIngestError::Cooldown
-                | crate::pex::PexIngestError::TooFrequent { .. },
-            ) => return Ok(()),
+            Err(err) => {
+                log::debug!(
+                    target: "webtor-engine",
+                    "pex_discard hash={} from={from} err={err:?}",
+                    &self.info_hash.to_hex()[..8],
+                );
+                return Ok(());
+            }
         };
         if let Some(time) = prior {
             last.insert(from, time);
@@ -1259,8 +1297,20 @@ impl TorrentInner {
             }
             let offset = i64::from(req - begin) * i64::from(BLOCK_SIZE);
             let len = (piece_obj.length - offset).clamp(0, i64::from(BLOCK_SIZE)) as usize;
-            if len == 0 || !matches!(ps.read_at(&mut buf[..len], offset), Ok(n) if n == len) {
+            if len == 0 {
                 continue;
+            }
+            match ps.read_at(&mut buf[..len], offset) {
+                Ok(n) if n == len => {}
+                Ok(_) => continue,
+                Err(err) => {
+                    log::warn!(
+                        target: "webtor-engine",
+                        "leaf_verify_read_fail hash={} piece={piece} begin={offset} err={err}",
+                        &self.info_hash.to_hex()[..8],
+                    );
+                    continue;
+                }
             }
             // The piece hash, once queued, owns the verdict on these blocks.
             if self.pieces.read().get(piece as usize).is_none_or(|p| p.checking || p.complete) {

@@ -10,6 +10,8 @@ data class QuickStreamTarget(
     val displayTitle: String,
     val season: Int? = null,
     val episode: Int? = null,
+    val reportedSeeders: Int? = null,
+    val reportedPeers: Int? = null,
 )
 
 data class PrepareDraft(
@@ -21,6 +23,7 @@ data class PrepareDraft(
     val busy: Boolean = false,
     val committed: Boolean = false,
     val query: String = "",
+    val startedAtMs: Long = System.currentTimeMillis(),
 )
 
 data class DeleteRequest(

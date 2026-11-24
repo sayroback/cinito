@@ -101,12 +101,18 @@ pub async fn start_stream_server(
                                 let service = service_fn(move |req| {
                                     handle_stream_request(req, source.clone())
                                 });
-                                let _ = Builder::new(TokioExecutor::new())
+                                if let Err(err) = Builder::new(TokioExecutor::new())
                                     .serve_connection(io, service)
-                                    .await;
+                                    .await
+                                {
+                                    crate::jni::log_debug(&format!("stream connection ended: {err}"));
+                                }
                             });
                         }
-                        Err(_) => break,
+                        Err(err) => {
+                            crate::jni::log_warn(&format!("stream accept failed, server stopping: {err}"));
+                            break;
+                        }
                     }
                 }
             }
@@ -225,6 +231,7 @@ async fn handle_stream_request(
 ) -> Result<Response<BoxBody<Bytes, io::Error>>, Infallible> {
     let path = req.uri().path();
     let Some((id, file_index)) = parse_stream_path(path) else {
+        crate::jni::log_warn(&format!("stream request path not matched path={path} status=404"));
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(text_body("Not Found"))
@@ -237,10 +244,12 @@ async fn handle_stream_request(
         req.headers().get(RANGE).and_then(|v| v.to_str().ok()).unwrap_or("-"),
     ));
     let id = id.to_owned();
+    let range_text = req.headers().get(RANGE).and_then(|v| v.to_str().ok()).unwrap_or("-").to_owned();
     let start = req.headers().get(RANGE).and_then(|v| v.to_str().ok()).map_or(-1, range_start);
+    let log_label = format!("id={id} file={file_index} range={range_text}");
     let opened = tokio::task::spawn_blocking(move || source.open_at(&id, file_index, start))
         .await
-        .unwrap_or_else(|e| Err(io::Error::other(e.to_string())));
+        .unwrap_or_else(|e| Err(io::Error::other(format!("open task failed: {e}"))));
     let reader = match opened {
         Ok(r) => r,
         Err(e) => {
@@ -250,6 +259,10 @@ async fn handle_stream_request(
                 io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
                 _ => StatusCode::CONFLICT,
             };
+            crate::jni::log_warn(&format!(
+                "stream open failed {log_label} status={} reason={e}",
+                status.as_u16()
+            ));
             return Ok(Response::builder()
                 .status(status)
                 .body(
@@ -269,6 +282,9 @@ async fn handle_stream_request(
         match parse_range(range_str, file_length) {
             Some(r) => (r.0, r.1, StatusCode::PARTIAL_CONTENT),
             None => {
+                crate::jni::log_warn(&format!(
+                    "stream range rejected {log_label} length={file_length} status=416"
+                ));
                 reader.close();
                 return Ok(Response::builder()
                     .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -289,6 +305,10 @@ async fn handle_stream_request(
         rx.recv().await.map(|frame| (frame, rx))
     }));
 
+    crate::jni::log_debug(&format!(
+        "stream response {log_label} status={} start={start} end={end}",
+        status.as_u16()
+    ));
     if req.method() != Method::HEAD && content_length > 0 {
         let reader_clone = reader.clone();
         tokio::spawn(async move {
@@ -318,16 +338,29 @@ async fn handle_stream_request(
                     Ok(Ok(Some(buf))) => {
                         let n = buf.len() as i64;
                         if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
+                            crate::jni::log_debug(&format!(
+                                "stream client gone {log_label} offset={off}"
+                            ));
                             break;
                         }
                         off += n;
                     }
                     Ok(Ok(None)) => break,
                     Ok(Err(e)) => {
-                        let _ = tx.send(Err(e)).await;
+                        crate::jni::log_warn(&format!(
+                            "stream read failed {log_label} offset={off} status=200 reason={e}"
+                        ));
+                        if tx.send(Err(e)).await.is_err() {
+                            crate::jni::log_debug(&format!("stream error not delivered {log_label}"));
+                        }
                         break;
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        crate::jni::log_warn(&format!(
+                            "stream read task failed {log_label} offset={off}: {e}"
+                        ));
+                        break;
+                    }
                 }
             }
             reader_clone.close();

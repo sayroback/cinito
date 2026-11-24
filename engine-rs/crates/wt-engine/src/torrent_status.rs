@@ -120,6 +120,17 @@ impl EngineServer {
                 stats.conn_stats.bytes_written_data,
                 paused,
             );
+            // Probe timeline: 1 s resolution, as this sampler's clock.
+            let rec = &mut *rec;
+            let metadata_ready = rec.torrent.info().is_some();
+            rec.probe.observe(
+                &rec.id,
+                &rec.info_hash,
+                rec.prepared,
+                metadata_ready,
+                stats.total_peers,
+                stats.conn_stats.bytes_read_data,
+            );
             down += rec.rates.down;
             up += rec.rates.up;
         }

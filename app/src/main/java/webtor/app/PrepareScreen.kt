@@ -1,20 +1,26 @@
 package webtor.app
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -51,6 +57,8 @@ fun PrepareScreen(
     onCancel: () -> Unit,
     onDirectPlay: () -> Unit,
     directPlayDefault: Boolean = false,
+    onPlayFile: ((Int) -> Unit)? = null,
+    onRetry: (() -> Unit)? = null,
 ) {
     BackHandler(onBack = onCancel)
     val torrent = draft.torrent
@@ -103,13 +111,13 @@ fun PrepareScreen(
                             .fillMaxWidth()
                             .heightIn(min = 48.dp),
                     ) {
-                        Text(if (directPlayDefault) "Ver ahora (Direct Play)" else "Descargar para ver sin conexión", maxLines = 1)
+                        Text(if (directPlayDefault) "Reproducir ahora (sin guardar)" else "Descargar en el teléfono", maxLines = 1)
                     }
                     OutlinedButton(
                         onClick = if (directPlayDefault) onStart else onDirectPlay,
                         enabled = canChoose && (!directPlayDefault || !insufficientSpace),
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text(if (directPlayDefault) "Descargar para ver sin conexión" else "Ver ahora (Direct Play · sin guardar)") }
+                    ) { Text(if (directPlayDefault) "Descargar en el teléfono" else "Reproducir ahora (sin guardar)") }
                 }
             }
         },
@@ -123,17 +131,57 @@ fun PrepareScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
                 horizontalAlignment = Alignment.Start,
             ) {
-                Text("Buscando archivos", style = MaterialTheme.typography.headlineSmall)
-                Text(
-                    prefetchStatus(draft) ?: "Buscando peers…",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth().height(4.dp),
-                    color = MaterialTheme.colorScheme.primary,
-                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
-                )
+                if (draft.error != null) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.25f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.45f)),
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(20.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Text(
+                                "No se pudo leer este torrent",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                            Text(
+                                draft.error,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = onRetry ?: onCancel,
+                                    modifier = Modifier.weight(1f).height(44.dp),
+                                ) {
+                                    Text("Reintentar")
+                                }
+                                if (onRetry != null) {
+                                    OutlinedButton(
+                                        onClick = onCancel,
+                                        modifier = Modifier.weight(1f).height(44.dp),
+                                    ) {
+                                        Text("Volver")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text("Buscando archivos", style = MaterialTheme.typography.headlineSmall)
+                    Text(
+                        prefetchStatus(draft) ?: "Buscando peers…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().height(4.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    )
+                }
             }
             return@Scaffold
         }
@@ -176,14 +224,31 @@ fun PrepareScreen(
                 }
             }
             items(torrent.files, key = { it.index }) { file ->
-                FileRow(file, checked = file.index in draft.selected, onToggle = { onToggle(file.index) })
+                val isVideo = file.name.isVideoName() || file.path.isVideoName()
+                FileRow(
+                    file = file,
+                    checked = file.index in draft.selected,
+                    onToggle = { onToggle(file.index) },
+                    onPlayFile = if (isVideo && onPlayFile != null) {
+                        { onPlayFile(file.index) }
+                    } else {
+                        null
+                    },
+                    playEnabled = !draft.busy,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun FileRow(file: TorrentFile, checked: Boolean, onToggle: () -> Unit) {
+private fun FileRow(
+    file: TorrentFile,
+    checked: Boolean,
+    onToggle: () -> Unit,
+    onPlayFile: (() -> Unit)? = null,
+    playEnabled: Boolean = true,
+) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -206,6 +271,11 @@ private fun FileRow(file: TorrentFile, checked: Boolean, onToggle: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        if (onPlayFile != null) {
+            IconButton(onClick = onPlayFile, enabled = playEnabled) {
+                Icon(Icons.Default.PlayArrow, contentDescription = "Reproducir")
+            }
         }
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)

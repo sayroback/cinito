@@ -19,6 +19,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.PlayArrow
@@ -134,6 +136,7 @@ fun TorrentFilesScreen(
     var fileQuery by rememberSaveable(entry.key) { mutableStateOf("") }
     var naturalOrder by rememberSaveable(entry.key) { mutableStateOf(true) }
     var fileFilter by rememberSaveable(entry.key) { mutableStateOf(DetailFileFilter.ALL) }
+    var technicalExpanded by rememberSaveable(entry.key) { mutableStateOf(false) }
 
     var subtitleMap by remember(entry.key) { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
     LaunchedEffect(entry.files) {
@@ -173,33 +176,33 @@ fun TorrentFilesScreen(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text("Details", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) },
+                title = { Text("Detalles", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Volver")
                     }
                 },
                 actions = {
                     if (!busy && entry.directPlay && entry.engineId != null) {
                         TextButton(onClick = onDrop) {
-                            Text("Drop")
+                            Text("Detener streaming")
                         }
                     }
                     if (!busy && !entry.complete) {
                         if (entry.paused || (entry.engineId == null && entry.lifecycleState != EntryLifecycleState.DOWNLOADING)) {
                             TextButton(onClick = onResume) {
-                                Text("Resume")
+                                Text("Reanudar")
                             }
                         } else {
                             TextButton(onClick = onPause) {
-                                Text("Pause")
+                                Text("Pausar")
                             }
                         }
                     }
                     IconButton(onClick = onDelete, enabled = !busy) {
                         Icon(
                             Icons.Default.Delete,
-                            contentDescription = "Remove download",
+                            contentDescription = "Eliminar descarga",
                         )
                     }
                 },
@@ -229,7 +232,7 @@ fun TorrentFilesScreen(
                         magnetUri?.let {
                             clipboardManager.setText(AnnotatedString(it))
                             copiedMagnet = true
-                            Toast.makeText(context, "Magnet link copied", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Enlace magnet copiado", Toast.LENGTH_SHORT).show()
                         }
                     },
                 )
@@ -237,7 +240,7 @@ fun TorrentFilesScreen(
             // UI-03: Playable files and episode playback precede diagnostics
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SectionTitle("Files", "${entry.selected.size} of ${files.size} selected")
+                    SectionTitle("Archivos", "${entry.selected.size} de ${files.size} seleccionados")
                     // A handful of files needs no search box or filters.
                     if (files.size >= 8 || fileQuery.isNotEmpty()) OutlinedTextField(
                         value = fileQuery,
@@ -245,12 +248,12 @@ fun TorrentFilesScreen(
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                         shape = RoundedCornerShape(12.dp),
-                        placeholder = { Text("Search files and episodes", style = MaterialTheme.typography.bodyMedium) },
+                        placeholder = { Text("Buscar archivos o episodios", style = MaterialTheme.typography.bodyMedium) },
                         leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
                         trailingIcon = if (fileQuery.isNotEmpty()) {
                             {
                                 IconButton(onClick = { fileQuery = "" }) {
-                                    Icon(Icons.Default.Clear, contentDescription = "Clear search")
+                                    Icon(Icons.Default.Clear, contentDescription = "Limpiar búsqueda")
                                 }
                             }
                         } else null,
@@ -263,7 +266,7 @@ fun TorrentFilesScreen(
                         FilterChip(
                             selected = fileFilter == DetailFileFilter.ALL,
                             onClick = { fileFilter = DetailFileFilter.ALL },
-                            label = { Text("All") },
+                            label = { Text("Todos") },
                         )
                         FilterChip(
                             selected = fileFilter == DetailFileFilter.VIDEOS,
@@ -273,13 +276,13 @@ fun TorrentFilesScreen(
                         FilterChip(
                             selected = fileFilter == DetailFileFilter.SUBTITLES,
                             onClick = { fileFilter = DetailFileFilter.SUBTITLES },
-                            label = { Text("Subtitles") },
+                            label = { Text("Subtítulos") },
                         )
                         Spacer(Modifier.width(8.dp))
                         FilterChip(
                             selected = naturalOrder,
                             onClick = { naturalOrder = !naturalOrder },
-                            label = { Text(if (naturalOrder) "Episode order" else "Torrent order") },
+                            label = { Text(if (naturalOrder) "Orden de episodios" else "Orden del torrent") },
                         )
                     }
                 }
@@ -287,7 +290,7 @@ fun TorrentFilesScreen(
             if (displayedFiles.isEmpty()) {
                 item {
                     Text(
-                        "No files match your search or filter.",
+                        "Ningún archivo coincide con tu búsqueda o filtro.",
                         modifier = Modifier.padding(vertical = 12.dp),
                         style = MaterialTheme.typography.bodyMedium,
                         color = colors.onSurfaceVariant,
@@ -333,19 +336,47 @@ fun TorrentFilesScreen(
                     },
                 )
             }
-            // Diagnostics follow files
-            item { TransferSection(entry) }
-            item { ConnectionMapSection(entry, client) }
-            item { TrackerDetailsSection(status) }
+            // Diagnostics follow files inside an expandable technical info section
             item {
-                PieceHeatGridSection(
-                    map = telemetry,
-                    frozen = entry.paused || entry.complete,
-                    files = entry.files,
-                    memoryBuffer = entry.directPlay,
-                )
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = colors.surfaceContainer),
+                ) {
+                    TextButton(
+                        onClick = { technicalExpanded = !technicalExpanded },
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            "Información técnica",
+                            modifier = Modifier.weight(1f),
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Start,
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = colors.onSurface,
+                        )
+                        Icon(
+                            imageVector = if (technicalExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = if (technicalExpanded) "Ocultar" else "Mostrar",
+                            tint = colors.primary,
+                        )
+                    }
+                }
             }
-            item { TechnicalSection(entry, status, telemetry, entry.selected.size) }
+            if (technicalExpanded) {
+                item { TransferSection(entry) }
+                item { ConnectionMapSection(entry, client) }
+                item { TrackerDetailsSection(status) }
+                item {
+                    PieceHeatGridSection(
+                        map = telemetry,
+                        frozen = entry.paused || entry.complete,
+                        files = entry.files,
+                        memoryBuffer = entry.directPlay,
+                    )
+                }
+                item { TechnicalSection(entry, status, telemetry, entry.selected.size) }
+            }
         }
     }
 }
@@ -390,12 +421,12 @@ private fun DownloadSummary(
                 color = labelColor,
             )
             Text(
-                if (entry.checking) "Checking saved data · ${entry.checkPercent}%"
-                else if (!entry.metadataReady) "Fetching file list…"
-                else if (entry.directPlay && entry.engineId == null) "Stopped · peers disconnected and RAM freed. Play starts it again."
-                else if (entry.directPlay && entry.liveStatus()?.resting == true) "Resting · peers released while idle. Reconnects when playback resumes."
-                else if (entry.directPlay) "${formatBytes(entry.downloaded)} cached · video stays in RAM"
-                else "${formatBytes(entry.downloaded)} of ${formatBytes(entry.total)} · $percent%",
+                if (entry.checking) "Comprobando datos · ${entry.checkPercent}%"
+                else if (!entry.metadataReady) "Obteniendo lista de archivos…"
+                else if (entry.directPlay && entry.engineId == null) "Detenido · peers desconectados y memoria liberada. Reproducir lo inicia de nuevo."
+                else if (entry.directPlay && entry.liveStatus()?.resting == true) "En reposo · peers liberados por inactividad. Se reconecta al reanudar."
+                else if (entry.directPlay) "${formatBytes(entry.downloaded)} en caché · el video permanece en memoria"
+                else "${formatBytes(entry.downloaded)} de ${formatBytes(entry.total)} · $percent%",
                 style = MaterialTheme.typography.bodySmall,
                 color = colors.onSurfaceVariant,
             )
@@ -429,9 +460,9 @@ private fun DownloadSummary(
                     Spacer(Modifier.width(6.dp))
                     Text(
                         when {
-                            resume != null -> "Continue at ${playbackTime(resume.playbackPositionMs)}"
-                            isVideo -> "Play"
-                            else -> "Open"
+                            resume != null -> "Continuar en ${playbackTime(resume.playbackPositionMs)}"
+                            isVideo -> "Reproducir"
+                            else -> "Abrir"
                         },
                         maxLines = 1,
                     )
@@ -445,14 +476,14 @@ private fun DownloadSummary(
                 TextButton(onClick = onShareMagnet, enabled = magnetAvailable) {
                     Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Share magnet")
+                    Text("Compartir magnet")
                 }
                 TextButton(onClick = onCopyMagnet, enabled = magnetAvailable) {
-                    Text(if (copiedMagnet) "Copied" else "Copy magnet")
+                    Text(if (copiedMagnet) "Copiado" else "Copiar magnet")
                 }
             }
             if (!magnetAvailable) {
-                Text("Magnet link not available yet", style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
+                Text("Enlace magnet aún no disponible", style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
             }
         }
     }
@@ -462,20 +493,20 @@ private fun DownloadSummary(
 private fun TransferSection(entry: DownloadEntry) {
     val colors = MaterialTheme.colorScheme
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        SectionTitle("Transfer")
+        SectionTitle("Transferencia")
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             TransferCard(
-                label = "Download",
+                label = "Descarga",
                 value = entry.liveDownloadSpeed()?.let(::formatSpeed) ?: "—",
                 modifier = Modifier.weight(1f),
             )
             TransferCard(
-                label = "Upload",
+                label = "Subida",
                 value = entry.liveUploadSpeed()?.let(::formatSpeed) ?: "—",
                 modifier = Modifier.weight(1f),
             )
             TransferCard(
-                label = "ETA",
+                label = "Tiempo est.",
                 value = formatEta(entry.selectedEta()) ?: "—",
                 modifier = Modifier.weight(1f),
             )
@@ -537,19 +568,19 @@ private fun TrackerDetailsSection(status: webtor.core.TorrentStatus?) {
             ) {
                 Text(
                     when {
-                        trackers.isEmpty() -> "Connection details · unavailable"
-                        else -> "Connection details · $working/${trackers.size} trackers responding"
+                        trackers.isEmpty() -> "Detalles de conexión · no disponible"
+                        else -> "Detalles de conexión · $working/${trackers.size} trackers respondiendo"
                     },
                     modifier = Modifier.weight(1f),
                     textAlign = androidx.compose.ui.text.style.TextAlign.Start,
                     color = colors.onSurface,
                 )
-                Text(if (expanded) "Hide" else "Show", color = colors.primary)
+                Text(if (expanded) "Ocultar" else "Mostrar", color = colors.primary)
             }
             if (expanded) {
                 if (trackers.isEmpty()) {
                     Text(
-                        "Tracker status is not available yet.",
+                        "El estado de los trackers aún no está disponible.",
                         modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 12.dp),
                         style = MaterialTheme.typography.bodySmall,
                         color = colors.onSurfaceVariant,
@@ -578,7 +609,7 @@ private fun TrackerDetailsSection(status: webtor.core.TorrentStatus?) {
                         }
                         if (trackers.size > MAX_TRACKERS_SHOWN) {
                             Text(
-                                "+${trackers.size - MAX_TRACKERS_SHOWN} more",
+                                "+${trackers.size - MAX_TRACKERS_SHOWN} más",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = colors.onSurfaceVariant,
                             )
@@ -633,7 +664,7 @@ private fun TorrentFileRow(
     val isVideo = file.name.isVideoName() || file.path.isVideoName()
     val isSub = file.name.isSubtitleName() || file.path.isSubtitleName()
     val complete = !directPlay && file.isVerifiedComplete
-    val canPlayVideo = isVideo && (directPlay || !file.uri.isNullOrBlank()) && (isSelected || complete)
+    val canPlayVideo = isVideo
     val canOpenOther = !isVideo && (isSelected || complete) && !file.uri.isNullOrBlank() && complete
     val showPriority = isSelected && !directPlay && !complete
     val priorityDownload = focused && showPriority
@@ -644,12 +675,12 @@ private fun TorrentFileRow(
         null
     }
     val statusText = when {
-        !isSelected -> "Not selected"
-        directPlay -> if (paused) "Direct Play · paused" else "Direct Play"
-        file.uri.isNullOrBlank() -> "Not downloaded"
-        complete -> "Ready"
-        paused -> "Paused"
-        else -> "Downloading"
+        !isSelected -> "No seleccionado"
+        directPlay -> if (paused) "Streaming en memoria · en pausa" else "Streaming en memoria"
+        file.uri.isNullOrBlank() -> "Sin descargar"
+        complete -> "Listo"
+        paused -> "En pausa"
+        else -> "Descargando"
     }
     var tracksExpanded by remember(file.index) { mutableStateOf(false) }
 
@@ -702,7 +733,7 @@ private fun TorrentFileRow(
                         )
                     }
                     if (priorityDownload) {
-                        Text("Priority download", style = MaterialTheme.typography.labelSmall, color = colors.primary)
+                        Text("Descarga prioritaria", style = MaterialTheme.typography.labelSmall, color = colors.primary)
                     }
                     upNext?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = colors.tertiary) }
                     watched?.let { fraction ->
@@ -723,7 +754,7 @@ private fun TorrentFileRow(
                     }
                     Text(
                         if (directPlay) "${formatBytes(file.length)} · $statusText"
-                        else "${formatBytes((file.length * file.progress).toLong())} of ${formatBytes(file.length)} · $statusText",
+                        else "${formatBytes((file.length * file.progress).toLong())} de ${formatBytes(file.length)} · $statusText",
                         style = MaterialTheme.typography.labelSmall,
                         color = colors.onSurfaceVariant,
                     )
@@ -751,12 +782,12 @@ private fun TorrentFileRow(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Audiotrack,
-                                    contentDescription = "Inspect audio tracks",
+                                    contentDescription = "Revisar pistas de audio",
                                     tint = colors.primary,
                                     modifier = Modifier.size(12.dp),
                                 )
                                 Text(
-                                    "Check audio tracks",
+                                    "Revisar pistas de audio",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = colors.primary,
                                 )
@@ -765,7 +796,7 @@ private fun TorrentFileRow(
                     }
                     if (pairedSubtitles.isNotEmpty()) {
                         Text(
-                            "Subtitles: ${pairedSubtitles.joinToString(", ")}",
+                            "Subtítulos: ${pairedSubtitles.joinToString(", ")}",
                             style = MaterialTheme.typography.labelSmall,
                             color = colors.primary,
                             maxLines = 1,
@@ -773,7 +804,7 @@ private fun TorrentFileRow(
                         )
                     } else if (isSub) {
                         Text(
-                            "External subtitle",
+                            "Subtítulo externo",
                             style = MaterialTheme.typography.labelSmall,
                             color = colors.tertiary,
                         )
@@ -807,7 +838,7 @@ private fun TorrentFileRow(
                             Spacer(Modifier.width(6.dp))
                         }
                         Text(
-                            if (isVideo) "Play" else "Open",
+                            if (isVideo) "Reproducir" else "Abrir",
                             style = MaterialTheme.typography.labelMedium,
                             maxLines = 1,
                         )
@@ -828,35 +859,35 @@ private fun TechnicalSection(
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     val infoHash = status?.infoHash ?: entry.key.takeIf { it.length == 40 } ?: "—"
-    val pieceDetails = telemetry?.let { "${it.totalPieces} pieces · ${formatBytes(it.pieceLength)} each" } ?: "—"
+    val pieceDetails = telemetry?.let { "${it.totalPieces} piezas · ${formatBytes(it.pieceLength)} c/u" } ?: "—"
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        SectionTitle("Technical information")
+        SectionTitle("Detalles técnicos")
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             TechnicalCard(
-                label = "Files",
-                value = "$selectedCount of ${entry.files.size} selected",
+                label = "Archivos",
+                value = "$selectedCount de ${entry.files.size} seleccionados",
                 modifier = Modifier.weight(1f),
             )
             TechnicalCard(
-                label = "Pieces",
+                label = "Piezas",
                 value = pieceDetails,
                 modifier = Modifier.weight(1f),
             )
         }
         TechnicalCard(
-            label = "Destination",
+            label = "Destino",
             value = entry.destination,
             modifier = Modifier.fillMaxWidth(),
         )
         TechnicalCard(
-            label = "Info hash (tap to copy)",
+            label = "Info hash (toca para copiar)",
             value = infoHash,
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable(enabled = infoHash != "—") {
                     clipboardManager.setText(AnnotatedString(infoHash))
-                    Toast.makeText(context, "Info hash copied", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Info hash copiado", Toast.LENGTH_SHORT).show()
                 },
             monospace = true,
         )
@@ -893,7 +924,7 @@ private fun TechnicalCard(
 /** Play next warm-up state for the row of [fileIndex]; null for other rows. */
 internal fun upNextLabel(preload: webtor.core.NextPreload?, fileIndex: Int): String? = when {
     preload == null || preload.fileIndex != fileIndex -> null
-    preload.ready -> "Up next · start loaded"
-    preload.active -> "Up next · loading start"
-    else -> "Up next · loads near the end"
+    preload.ready -> "Siguiente · inicio cargado"
+    preload.active -> "Siguiente · cargando inicio"
+    else -> "Siguiente · se carga cerca del final"
 }

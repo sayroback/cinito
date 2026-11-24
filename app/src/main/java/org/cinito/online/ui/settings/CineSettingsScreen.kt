@@ -92,7 +92,11 @@ fun CineSettingsScreen(
     onSaveTmdbApiKey: (String) -> Unit,
     onClearMetadataCache: () -> Unit,
     onShowRawFilenames: (Boolean) -> Unit,
+    onBroadGeneralSearch: (Boolean) -> Unit = {},
+    onHideAdultContent: (Boolean) -> Unit = {},
+    onAdultOnlySearch: (Boolean) -> Unit = {},
     onToggleProvider: (String, Boolean) -> Unit,
+    onToggleAdultProvider: (String, Boolean) -> Unit = { _, _ -> },
     onAddTorznab: (String, String, String, Set<SearchCategory>) -> Unit,
     onRemoveTorznab: (String) -> Unit,
     onPickFolder: () -> Unit,
@@ -337,6 +341,20 @@ fun CineSettingsScreen(
                     checked = prefs.showRawFilenames,
                     onCheckedChange = onShowRawFilenames,
                 )
+                SettingsDivider()
+                RowSwitch(
+                    title = "Búsqueda general amplia (videos en general)",
+                    subtitle = "En categoría Todo, amplía Knaben, ThePirateBay, SolidTorrents, LimeTorrents, BitSearch, TheRarBg, Internet Archive y Torznab a videos fuera de cine/series.",
+                    checked = prefs.broadGeneralSearchEnabled,
+                    onCheckedChange = onBroadGeneralSearch,
+                )
+                SettingsDivider()
+                RowSwitch(
+                    title = "Filtrar contenido +18 (NSFW)",
+                    subtitle = "Bloquea resultados +18 en APIs compatibles y por título/descripción (activo por defecto).",
+                    checked = prefs.hideAdultContent,
+                    onCheckedChange = onHideAdultContent,
+                )
             }
         }
 
@@ -344,12 +362,46 @@ fun CineSettingsScreen(
             SettingsCard("Motores de búsqueda y Torznab") {
                 builtinProviders.forEachIndexed { idx, info ->
                     if (idx > 0) SettingsDivider()
-                    RowSwitch(
-                        title = info.name,
-                        subtitle = info.url,
-                        checked = info.id in prefs.enabledProviderIds,
-                        onCheckedChange = { checked -> onToggleProvider(info.id, checked) },
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        RowSwitch(
+                            title = info.name,
+                            subtitle = info.url,
+                            checked = info.id in prefs.enabledProviderIds,
+                            onCheckedChange = { checked -> onToggleProvider(info.id, checked) },
+                        )
+                        if (info.supportsAdultContent) {
+                            val isAdultOnlyProvider = info.categories == setOf(SearchCategory.Adult)
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Surface(
+                                    shape = RoundedCornerShape(7.dp),
+                                    color = if (isAdultOnlyProvider) CinemaColors.Danger.copy(alpha = 0.16f) else CinemaColors.PrimaryMuted,
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (isAdultOnlyProvider) CinemaColors.Danger.copy(alpha = 0.42f) else CinemaColors.HairlineBorder,
+                                    ),
+                                ) {
+                                    Text(
+                                        text = if (isAdultOnlyProvider) "Solo +18" else "Soporta +18",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isAdultOnlyProvider) CinemaColors.Danger else CinemaColors.TextSecondary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                    )
+                                }
+                                if (!prefs.hideAdultContent && info.id in prefs.enabledProviderIds) {
+                                    val adultEnabled = info.id !in prefs.disabledAdultProviderIds
+                                    FilterChip(
+                                        selected = adultEnabled,
+                                        onClick = { onToggleAdultProvider(info.id, !adultEnabled) },
+                                        label = { Text("En +18") },
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
                 SettingsDivider()
                 Row(
@@ -518,6 +570,7 @@ private fun RowSwitch(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun AddTorznabDialog(
     onDismiss: () -> Unit,
@@ -526,6 +579,9 @@ private fun AddTorznabDialog(
     var name by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
     var apiKey by remember { mutableStateOf("") }
+    var selectedCategories by remember {
+        mutableStateOf(setOf(SearchCategory.Movies, SearchCategory.Series, SearchCategory.Anime))
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -560,6 +616,35 @@ private fun AddTorznabDialog(
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Text(
+                    text = "Categorías habilitadas",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = CinemaColors.TextSecondary,
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    listOf(
+                        SearchCategory.Movies,
+                        SearchCategory.Series,
+                        SearchCategory.Anime,
+                        SearchCategory.Adult,
+                    ).forEach { cat ->
+                        val selected = cat in selectedCategories
+                        FilterChip(
+                            selected = selected,
+                            onClick = {
+                                selectedCategories = if (selected) {
+                                    selectedCategories - cat
+                                } else {
+                                    selectedCategories + cat
+                                }
+                            },
+                            label = { Text(cat.label) },
+                        )
+                    }
+                }
             }
         },
         confirmButton = {
@@ -569,10 +654,10 @@ private fun AddTorznabDialog(
                         name,
                         url,
                         apiKey,
-                        setOf(SearchCategory.Movies, SearchCategory.Series, SearchCategory.Anime),
+                        selectedCategories,
                     )
                 },
-                enabled = name.isNotBlank() && url.isNotBlank() && apiKey.isNotBlank(),
+                enabled = name.isNotBlank() && url.isNotBlank() && apiKey.isNotBlank() && selectedCategories.isNotEmpty(),
             ) { Text("Guardar") }
         },
         dismissButton = {

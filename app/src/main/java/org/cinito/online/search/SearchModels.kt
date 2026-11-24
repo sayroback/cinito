@@ -13,6 +13,7 @@ enum class SearchCategory(val label: String) {
     Series("Series"),
     Anime("Anime"),
     Other("Otros"),
+    Adult("+18"),
 }
 
 enum class SearchLanguageFilter(val label: String) {
@@ -67,6 +68,8 @@ data class SearchProviderInfo(
     val maxQueriesPerSearch: Int = 3,
     val supportsImdbSearch: Boolean = false,
     val requiresImdbSearch: Boolean = supportsImdbSearch,
+    val supportsAdultContent: Boolean = false,
+    val hasStrictAdultCategory: Boolean = false,
 )
 
 data class TorznabConfig(
@@ -77,9 +80,20 @@ data class TorznabConfig(
     val categories: Set<SearchCategory> = setOf(SearchCategory.Movies, SearchCategory.Series, SearchCategory.Anime),
 )
 
+data class SearchRequestOptions(
+    val broadGeneralSearch: Boolean = false,
+    val hideAdultContent: Boolean = true,
+    val adultOnly: Boolean = false,
+)
+
 interface TorrentSearchProvider {
     val info: SearchProviderInfo
     suspend fun search(query: String, category: SearchCategory): List<TorrentSearchResult>
+    suspend fun search(
+        query: String,
+        category: SearchCategory,
+        options: SearchRequestOptions,
+    ): List<TorrentSearchResult> = search(query, category)
     suspend fun searchByImdb(
         imdbId: String,
         category: SearchCategory,
@@ -96,11 +110,12 @@ object SearchUtils {
         "udp://tracker.opentrackr.org:1337/announce",
         "udp://open.stealth.si:80/announce",
         "udp://tracker.torrent.eu.org:451/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://open.tracker.cl:1337/announce",
+        "udp://exodus.desync.com:6969/announce",
         "udp://explodie.org:6969/announce",
         "udp://tracker.qu.ax:6969/announce",
         "udp://tracker.dler.org:6969/announce",
-        "udp://open.demonii.com:1337/announce",
-        "udp://exodus.desync.com:6969/announce",
     )
 
     private val BTIH_HEX = Regex("""(?i)xt=urn:btih:([a-f0-9]{40}|[a-z2-7]{32})""")
@@ -165,6 +180,18 @@ object SearchUtils {
     fun encodeUrl(value: String): String =
         java.net.URLEncoder.encode(value.trim(), "UTF-8").replace("+", "%20")
 
+    fun enrichMagnetTrackers(magnetUri: String, minTrackers: Int = 3): String {
+        if (!magnetUri.startsWith("magnet:?", ignoreCase = true)) return magnetUri
+        val existing = extractTrackersFromMagnet(magnetUri)
+            .mapTo(LinkedHashSet()) { it.trim().lowercase(Locale.ROOT) }
+        if (existing.size >= minTrackers) return magnetUri
+        val additions = DEFAULT_TRACKERS.filter { tr ->
+            existing.add(tr.lowercase(Locale.ROOT))
+        }
+        if (additions.isEmpty()) return magnetUri
+        return magnetUri + additions.joinToString("") { "&tr=${encodeUrl(it)}" }
+    }
+
     fun buildMagnet(infoHash: String, displayName: String? = null): String {
         val cleanHash = infoHash.trim().lowercase(Locale.ROOT)
         val tr = DEFAULT_TRACKERS.joinToString("&") { "tr=$it" }
@@ -205,8 +232,16 @@ object SearchUtils {
     }
 
     private val SPAM_EXEC_SUFFIX = Regex("""(?i)(?:\.|[\s\-_]+downloader\.)(?:exe|msi|scr|bat|cmd|apk|lnk)\s*$""")
+    private val ADULT_CONTENT_REGEX = Regex(
+        """(?i)(?:^|[\s.\-_(\[/,|])(xxx|porno?|hentai|nsfw|onlyfans|brazzers|bangbros|naughtyamerica|realitykings|mofos|blacked|tushy|vixen|javhd|jav|erotica|milf|bdsm|fetish|18\+|fc2|caribbeancom|1pondo|pornhub|xvideos|xnxx|fansly|manyvids|chaturbate|camsoda|stripchat|adult[\s._-]*(?:video|movie|film|pack)|hardcore[\s._-]*porn)(?:$|[\s.\-_)\]/,|])""",
+    )
 
     fun isExecutableSpam(title: String): Boolean = SPAM_EXEC_SUFFIX.containsMatchIn(title.trim())
+
+    fun isAdultContent(title: String, description: String? = null): Boolean {
+        if (ADULT_CONTENT_REGEX.containsMatchIn(title)) return true
+        return !description.isNullOrBlank() && ADULT_CONTENT_REGEX.containsMatchIn(description)
+    }
 
     fun makeResult(
         providerId: String,
@@ -227,7 +262,8 @@ object SearchUtils {
         subtitleLanguageField: String? = null,
         sourceRecordId: String? = null,
     ): TorrentSearchResult {
-        val hash = extractInfoHash(magnetUri)
+        val enrichedMagnet = enrichMagnetTrackers(magnetUri)
+        val hash = extractInfoHash(enrichedMagnet)
         val parsed = MediaTitleParser.parse(title, isAnimeHint = category == SearchCategory.Anime)
         val lang = MediaLanguageClassifier.classify(
             title = title,
@@ -245,7 +281,7 @@ object SearchUtils {
             peers = peers.coerceAtLeast(0),
             providerId = providerId,
             providerName = providerName,
-            magnetUri = magnetUri,
+            magnetUri = enrichedMagnet,
             infoHash = hash,
             uploadDateEpochSec = uploadDateEpochSec,
             category = category,

@@ -11,6 +11,8 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.cinito.online.metadata.CatalogFeed
@@ -20,11 +22,14 @@ import org.cinito.online.metadata.MediaMetadata
 import org.cinito.online.metadata.MetadataRepository
 import org.cinito.online.search.PlayabilityContext
 import org.cinito.online.search.PlayabilityVerdict
+import org.cinito.online.search.ProbePriority
+import org.cinito.online.search.ProbeProfile
 import org.cinito.online.search.SearchCategory
 import org.cinito.online.search.SearchLanguageFilter
 import org.cinito.online.search.SearchService
 import org.cinito.online.search.SearchSortOrder
 import org.cinito.online.search.SearchTitleResolution
+import org.cinito.online.search.SearchUtils
 import org.cinito.online.search.SwarmDiagnosticsCoordinator
 import org.cinito.online.search.SwarmProbeResult
 import org.cinito.online.search.TorrentSearchResult
@@ -32,6 +37,7 @@ import org.cinito.online.search.TorznabConfig
 import org.cinito.online.search.UdpTrackerScraper
 import org.cinito.online.settings.AppPreferences
 import org.cinito.online.settings.PlayabilityDiagnosticsMode
+import java.util.Locale
 
 /**
  * Coordinates all state, caching, and network searches for the Discover catalog,
@@ -70,13 +76,60 @@ class ExploreCoordinator(
     private var detailScrapeJob: Job? = null
     private var detailProbeJob: Job? = null
     private var detailProbeToken: Long = 0L
+    private var detailScanJob: Job? = null
+    private var detailScanToken: Long = 0L
     private var searchTabJob: Job? = null
     private var searchScrapeJob: Job? = null
     private var searchProbeJob: Job? = null
     private var searchProbeToken: Long = 0L
+    private var searchScanJob: Job? = null
+    private var searchScanToken: Long = 0L
+
+    init {
+        scope.launch {
+            preferencesFlow
+                .map { it.hideAdultContent }
+                .distinctUntilChanged()
+                .collect { hideAdult ->
+                    if (hideAdult) {
+                        var resetAdultCategory = false
+                        _search.update { cur ->
+                            val wasAdultCategory = cur.category == SearchCategory.Adult
+                            if (wasAdultCategory) resetAdultCategory = true
+                            val filtered = cur.rawResults.filterNot {
+                                it.category == SearchCategory.Adult ||
+                                    SearchUtils.isAdultContent(it.title, it.description)
+                            }
+                            if (!wasAdultCategory && filtered.size == cur.rawResults.size) {
+                                cur
+                            } else {
+                                cur.copy(
+                                    category = if (wasAdultCategory) SearchCategory.All else cur.category,
+                                    rawResults = filtered,
+                                    queriedScopes = if (wasAdultCategory) emptySet() else cur.queriedScopes,
+                                    isSearching = if (wasAdultCategory) false else cur.isSearching,
+                                    isScrapingSwarm = if (wasAdultCategory) false else cur.isScrapingSwarm,
+                                    probingHashes = if (wasAdultCategory) emptySet() else cur.probingHashes,
+                                    swarmScan = if (wasAdultCategory) SwarmScanState() else cur.swarmScan,
+                                )
+                            }
+                        }
+                        if (resetAdultCategory) {
+                            searchTabJob?.cancel()
+                            searchScrapeJob?.cancel()
+                            searchProbeJob?.cancel()
+                            searchScanToken++
+                            searchScanJob?.cancel()
+                        }
+                    }
+                }
+        }
+    }
 
     fun cancelProbeAndClaimOwnership(result: TorrentSearchResult) {
         val hash = result.normalizedInfoHash ?: return
+        pauseDetailScan()
+        pauseSearchScan()
         swarmDiagnostics?.claimExternalOwnership(hash)
         if (_discover.value.activeDetail?.probingHashes?.contains(hash) == true) {
             detailProbeToken++
@@ -491,6 +544,8 @@ class ExploreCoordinator(
         detailSearchJob?.cancel()
         detailScrapeJob?.cancel()
         detailProbeJob?.cancel()
+        detailScanToken++
+        detailScanJob?.cancel()
 
         val cacheKey = "${media.type}:${media.id}"
         val cached = _discover.value.detailCache[cacheKey]
@@ -604,6 +659,8 @@ class ExploreCoordinator(
         detailSearchJob?.cancel()
         detailScrapeJob?.cancel()
         detailProbeJob?.cancel()
+        detailScanToken++
+        detailScanJob?.cancel()
         _discover.update { cur ->
             val active = cur.activeDetail ?: return@update cur
             val snapshotKey = active.episodeSnapshotKey()
@@ -626,6 +683,7 @@ class ExploreCoordinator(
                 isLoadingDetails = false,
                 scrollIndex = 0,
                 scrollOffset = 0,
+                swarmScan = SwarmScanState(),
                 episodeSnapshots = updatedSnapshots,
             )
             val nextCache = cur.detailCache.toMutableMap().apply {
@@ -653,6 +711,8 @@ class ExploreCoordinator(
         detailSearchJob?.cancel()
         detailScrapeJob?.cancel()
         detailProbeJob?.cancel()
+        detailScanToken++
+        detailScanJob?.cancel()
         var cachedHit = false
         _discover.update { cur ->
             val active = cur.activeDetail ?: return@update cur
@@ -686,6 +746,7 @@ class ExploreCoordinator(
                 isScrapingSwarm = false,
                 isSearching = false,
                 showAllResults = false,
+                swarmScan = SwarmScanState(),
                 episodeSnapshots = nextSnapshots,
             )
             cur.copy(activeDetail = nextDetail)
@@ -764,12 +825,15 @@ class ExploreCoordinator(
         detailSearchJob?.cancel()
         detailScrapeJob?.cancel()
         detailProbeJob?.cancel()
+        detailScanToken++
+        detailScanJob?.cancel()
         updateActiveDetailIfMatch(cacheKey) { d ->
             d.copy(
                 rawResults = seedResults,
                 isSearching = true,
                 isScrapingSwarm = false,
                 probingHashes = emptySet(),
+                swarmScan = SwarmScanState(),
                 failures = emptyList(),
                 completedProviders = 0,
                 totalProviders = 0,
@@ -790,6 +854,7 @@ class ExploreCoordinator(
                 seasonHint = srcQuery.season,
                 episodeHint = srcQuery.episode,
                 skipTitleResolution = srcQuery.imdbId != null && srcQuery.alternateQuery != null,
+                disabledAdultProviderIds = prefs.disabledAdultProviderIds,
             ).collect { batch ->
                 updateActiveDetailIfMatch(cacheKey) { d ->
                     if (d.selectedSeason != season || d.selectedEpisode != episode) {
@@ -847,7 +912,8 @@ class ExploreCoordinator(
             if (snapshot.isEmpty()) return@launch
             updateActiveDetailIfMatch(cacheKey) { it.copy(isScrapingSwarm = true) }
             try {
-                val stats = runCatchingNonCancellation { udpScraper.scrapeBatch(snapshot, maxItems = 15) }
+                val scrapeCandidates = snapshot.sortedByDescending { it.seeders }
+                val stats = runCatchingNonCancellation { udpScraper.scrapeBatch(scrapeCandidates, maxItems = 40) }
                     .getOrDefault(emptyMap())
                 var stillMatches = false
                 updateActiveDetailIfMatch(cacheKey) { d ->
@@ -915,9 +981,13 @@ class ExploreCoordinator(
         val alreadyFinished = !detail.isSearching && detail.languageFilter in detail.queriedFilters
         detailScrapeJob?.cancel()
         detailProbeJob?.cancel()
+        detailScanToken++
+        detailScanJob?.cancel()
         searchTabJob?.cancel()
         searchScrapeJob?.cancel()
         searchProbeJob?.cancel()
+        searchScanToken++
+        searchScanJob?.cancel()
         _search.update { cur ->
             val base = cur.copy(
                 query = srcQuery.query,
@@ -942,6 +1012,7 @@ class ExploreCoordinator(
                 originCatalogTitle = detail.media.title,
                 scrollIndex = 0,
                 scrollOffset = 0,
+                swarmScan = SwarmScanState(),
             )
             if (alreadyFinished) {
                 base.copy(queriedScopes = setOf(base.scopeKey()))
@@ -969,10 +1040,19 @@ class ExploreCoordinator(
     fun searchDirectFromDiscover(query: String, category: SearchCategory) {
         val clean = query.trim()
         if (clean.isEmpty()) return
-        onRecordRecentSearch(clean)
+        val effectiveAdultOnly = isEffectiveAdultOnly(
+            prefs = preferencesFlow.value,
+            category = category,
+            originCatalogTitle = null,
+        )
+        if (!effectiveAdultOnly && category != SearchCategory.Adult) {
+            onRecordRecentSearch(clean)
+        }
         searchTabJob?.cancel()
         searchScrapeJob?.cancel()
         searchProbeJob?.cancel()
+        searchScanToken++
+        searchScanJob?.cancel()
         _search.update {
             it.copy(
                 query = clean,
@@ -995,6 +1075,7 @@ class ExploreCoordinator(
                 originCatalogTitle = null,
                 scrollIndex = 0,
                 scrollOffset = 0,
+                swarmScan = SwarmScanState(),
             )
         }
         runSearchTabQuery(force = true, mergeExisting = false)
@@ -1011,10 +1092,20 @@ class ExploreCoordinator(
             clearSearch()
             return
         }
-        onRecordRecentSearch(clean)
+        val curCategory = _search.value.category
+        val effectiveAdultOnly = isEffectiveAdultOnly(
+            prefs = preferencesFlow.value,
+            category = curCategory,
+            originCatalogTitle = null,
+        )
+        if (!effectiveAdultOnly && curCategory != SearchCategory.Adult) {
+            onRecordRecentSearch(clean)
+        }
         searchTabJob?.cancel()
         searchScrapeJob?.cancel()
         searchProbeJob?.cancel()
+        searchScanToken++
+        searchScanJob?.cancel()
         _search.update {
             it.copy(
                 query = raw,
@@ -1036,6 +1127,7 @@ class ExploreCoordinator(
                 isScrapingSwarm = false,
                 scrollIndex = 0,
                 scrollOffset = 0,
+                swarmScan = SwarmScanState(),
             )
         }
         runSearchTabQuery(force = true, mergeExisting = false)
@@ -1045,6 +1137,8 @@ class ExploreCoordinator(
         searchTabJob?.cancel()
         searchScrapeJob?.cancel()
         searchProbeJob?.cancel()
+        searchScanToken++
+        searchScanJob?.cancel()
         _search.update {
             it.copy(
                 query = "",
@@ -1067,6 +1161,7 @@ class ExploreCoordinator(
                 isSearching = false,
                 scrollIndex = 0,
                 scrollOffset = 0,
+                swarmScan = SwarmScanState(),
             )
         }
     }
@@ -1077,6 +1172,8 @@ class ExploreCoordinator(
         searchTabJob?.cancel()
         searchScrapeJob?.cancel()
         searchProbeJob?.cancel()
+        searchScanToken++
+        searchScanJob?.cancel()
         _search.update {
             it.copy(
                 category = category,
@@ -1089,6 +1186,7 @@ class ExploreCoordinator(
                 isScrapingSwarm = false,
                 scrollIndex = 0,
                 scrollOffset = 0,
+                swarmScan = SwarmScanState(),
             )
         }
         if (cur.submittedQuery.isNotBlank()) {
@@ -1098,6 +1196,10 @@ class ExploreCoordinator(
 
     fun setSearchSortOrder(order: SearchSortOrder) {
         _search.update { it.copy(sortOrder = order) }
+    }
+
+    fun setHideDeadSearchResults(hide: Boolean) {
+        _search.update { it.copy(hideDeadResults = hide) }
     }
 
     fun setSearchLanguageFilter(filter: SearchLanguageFilter) {
@@ -1134,25 +1236,48 @@ class ExploreCoordinator(
         }
     }
 
+    private fun isEffectiveAdultOnly(
+        prefs: AppPreferences,
+        category: SearchCategory,
+        originCatalogTitle: String?,
+    ): Boolean {
+        val applyAdultOnlyPref = prefs.adultOnlySearch &&
+            (category == SearchCategory.All || category == SearchCategory.Adult) &&
+            originCatalogTitle == null
+        return !prefs.hideAdultContent && (applyAdultOnlyPref || category == SearchCategory.Adult)
+    }
+
     private fun runSearchTabQuery(force: Boolean, mergeExisting: Boolean) {
         val snap = _search.value
         if (snap.submittedQuery.isBlank()) return
-        val scopeKey = snap.scopeKey()
+        val prefs = preferencesFlow.value
+        val effectiveAdultOnly = isEffectiveAdultOnly(
+            prefs = prefs,
+            category = snap.category,
+            originCatalogTitle = snap.originCatalogTitle,
+        )
+        val scopeKey = snap.scopeKey(
+            broadGeneralSearch = prefs.broadGeneralSearchEnabled,
+            hideAdultContent = prefs.hideAdultContent,
+            adultOnly = effectiveAdultOnly,
+        )
         if (!force && scopeKey in snap.queriedScopes) return
 
         val seedResults = if (mergeExisting) snap.rawResults else emptyList()
-        val prefs = preferencesFlow.value
         val torznab = torznabFlow.value
 
         searchTabJob?.cancel()
         searchScrapeJob?.cancel()
         searchProbeJob?.cancel()
+        searchScanToken++
+        searchScanJob?.cancel()
         _search.update {
             it.copy(
                 rawResults = seedResults,
                 isSearching = true,
                 isScrapingSwarm = false,
                 probingHashes = emptySet(),
+                swarmScan = SwarmScanState(),
                 failures = emptyList(),
                 completedProviders = 0,
                 totalProviders = 0,
@@ -1172,9 +1297,18 @@ class ExploreCoordinator(
                 seasonHint = snap.activeSeasonHint,
                 episodeHint = snap.activeEpisodeHint,
                 skipTitleResolution = snap.activeImdbId != null && snap.activeAlternateQuery != null,
+                broadGeneralSearch = prefs.broadGeneralSearchEnabled,
+                hideAdultContent = prefs.hideAdultContent,
+                adultOnly = effectiveAdultOnly,
+                disabledAdultProviderIds = prefs.disabledAdultProviderIds,
             ).collect { batch ->
                 _search.update { cur ->
-                    if (cur.scopeKey() != scopeKey) return@update cur
+                    if (cur.scopeKey(
+                            broadGeneralSearch = prefs.broadGeneralSearchEnabled,
+                            hideAdultContent = prefs.hideAdultContent,
+                            adultOnly = effectiveAdultOnly,
+                        ) != scopeKey
+                    ) return@update cur
                     val baseForEnrich = if (mergeExisting) cur.rawResults else cur.rawResults.filter { existing ->
                         batch.results.any { it.id == existing.id }
                     }
@@ -1223,6 +1357,8 @@ class ExploreCoordinator(
             season = detail.selectedSeason,
             episode = detail.selectedEpisode,
             targets = candidates,
+            priority = ProbePriority.BACKGROUND_SCAN,
+            profile = ProbeProfile.BACKGROUND_SCAN,
         )
     }
 
@@ -1236,6 +1372,8 @@ class ExploreCoordinator(
             episode = detail.selectedEpisode,
             targets = listOf(result),
             forceRefresh = true,
+            priority = ProbePriority.USER_CLICK,
+            profile = ProbeProfile.USER_CLICK,
         )
     }
 
@@ -1261,6 +1399,8 @@ class ExploreCoordinator(
             season = snap.activeSeasonHint,
             episode = snap.activeEpisodeHint,
             targets = candidates,
+            priority = ProbePriority.BACKGROUND_SCAN,
+            profile = ProbeProfile.BACKGROUND_SCAN,
         )
     }
 
@@ -1274,7 +1414,509 @@ class ExploreCoordinator(
             episode = snap.activeEpisodeHint,
             targets = listOf(result),
             forceRefresh = true,
+            priority = ProbePriority.USER_CLICK,
+            profile = ProbeProfile.USER_CLICK,
         )
+    }
+
+    fun startProgressiveSearchScan(batchSize: Int = lastScanBatchSize, ignoreCheckpoint: Boolean = false) {
+        lastScanBatchSize = batchSize.coerceIn(1, 10)
+        val runBatch = lastScanBatchSize
+        android.util.Log.i("ScanCoord", "search scan start batch=$runBatch ignoreCheckpoint=$ignoreCheckpoint")
+        val prober = swarmDiagnostics ?: return
+        if (!prober.isAvailable) return
+        val snap = _search.value
+        val scopeKey = snap.scopeKey()
+        val context = PlayabilityContext(
+            requestedSeason = snap.activeSeasonHint,
+            requestedEpisode = snap.activeEpisodeHint,
+        )
+        val allCandidates = buildProgressiveScanCandidates(
+            results = snap.rawResults,
+            languageFilter = snap.languageFilter,
+            context = context,
+            scrapeStatsByHash = snap.swarmStatsByHash,
+            probeResultsByHash = snap.probeResultsByHash,
+        )
+        val existingProbes = allCandidates.mapNotNull { cand ->
+            cand.normalizedInfoHash?.let { snap.probeResultsByHash[it] }
+        }.filterNot { it.isPolicyBlocked }
+        val initialTested = existingProbes.size
+        val initialLive = existingProbes.count { it.isVerifiedLive }
+        val initialDead = existingProbes.count { it.isFailed }
+        val untested = allCandidates.filter { cand ->
+            val hash = cand.normalizedInfoHash ?: return@filter false
+            val existing = snap.probeResultsByHash[hash]
+            existing == null || existing.isPolicyBlocked
+        }
+        if (allCandidates.isEmpty()) {
+            _search.update { it.copy(swarmScan = SwarmScanState()) }
+            return
+        }
+        if (untested.isEmpty()) {
+            _search.update {
+                it.copy(
+                    swarmScan = SwarmScanState(
+                        status = SwarmScanStatus.Completed,
+                        testedCount = initialTested,
+                        totalCount = allCandidates.size,
+                        verifiedLiveCount = initialLive,
+                        deadCount = initialDead,
+                    ),
+                )
+            }
+            return
+        }
+
+        val token = ++searchScanToken
+        searchScanJob?.cancel()
+        _search.update {
+            if (it.scopeKey() != scopeKey) it
+            else it.copy(
+                swarmScan = SwarmScanState(
+                    status = SwarmScanStatus.Running,
+                    testedCount = initialTested,
+                    totalCount = allCandidates.size,
+                    verifiedLiveCount = initialLive,
+                    deadCount = initialDead,
+                ),
+            )
+        }
+
+        val untestedHashes = untested.mapNotNull { it.normalizedInfoHash }.toSet()
+        searchScanJob = scope.launch {
+            var tested = initialTested
+            var live = initialLive
+            var dead = initialDead
+            var paused = false
+            var runTested = 0
+            try {
+                for (candidate in untested) {
+                    coroutineContext.ensureActive()
+                    val curSnap = _search.value
+                    if (curSnap.scopeKey() != scopeKey) return@launch
+                    val hash = candidate.normalizedInfoHash ?: continue
+                    val alreadyProbed = curSnap.probeResultsByHash[hash]
+                    if (alreadyProbed != null && !alreadyProbed.isPolicyBlocked) continue
+
+                    _search.update { cur ->
+                        if (cur.scopeKey() != scopeKey) cur
+                        else cur.copy(
+                            probingHashes = cur.probingHashes + hash,
+                            swarmScan = cur.swarmScan.copy(
+                                status = SwarmScanStatus.Running,
+                                currentHash = hash,
+                            ),
+                        )
+                    }
+
+                    val probed = runCatchingNonCancellation {
+                        prober.probeSingle(
+                            result = candidate,
+                            season = snap.activeSeasonHint,
+                            episode = snap.activeEpisodeHint,
+                            forceRefresh = false,
+                            priority = ProbePriority.BACKGROUND_SCAN,
+                            profile = ProbeProfile.BACKGROUND_SCAN,
+                        )
+                    }.getOrNull()
+                    if (probed == null) {
+                        android.util.Log.w("ScanCoord", "scan probe returned null hash=${hash.take(8)}")
+                    }
+
+                    if (probed?.isPolicyBlocked == true) {
+                        _search.update { cur ->
+                            if (cur.scopeKey() != scopeKey) cur.copy(probingHashes = cur.probingHashes - hash)
+                            else cur.copy(
+                                probingHashes = cur.probingHashes - hash,
+                                swarmScan = cur.swarmScan.copy(
+                                    status = SwarmScanStatus.Paused,
+                                    currentHash = null,
+                                ),
+                            )
+                        }
+                        paused = true
+                        break
+                    }
+
+                    tested++
+                    val isLive = probed?.isVerifiedLive == true
+                    if (isLive) live++ else dead++
+                    runTested++
+                    val hitCheckpoint = runTested >= runBatch && tested < allCandidates.size
+
+                    _search.update { cur ->
+                        if (cur.scopeKey() != scopeKey) {
+                            cur.copy(probingHashes = cur.probingHashes - hash)
+                        } else {
+                            val nextMap = if (probed != null) cur.probeResultsByHash + (probed.infoHash to probed) else cur.probeResultsByHash
+                            cur.copy(
+                                probeResultsByHash = nextMap,
+                                probingHashes = cur.probingHashes - hash,
+                                swarmScan = SwarmScanState(
+                                    status = if (hitCheckpoint) SwarmScanStatus.Paused else SwarmScanStatus.Running,
+                                    testedCount = tested,
+                                    totalCount = allCandidates.size,
+                                    verifiedLiveCount = live,
+                                    deadCount = dead,
+                                    currentHash = null,
+                                ),
+                            )
+                        }
+                    }
+
+                    if (hitCheckpoint) {
+                        android.util.Log.i("ScanCoord", "scan checkpoint tested=$tested live=$live dead=$dead")
+                        paused = true
+                        break
+                    }
+                }
+                android.util.Log.i("ScanCoord", "scan loop end paused=$paused tested=$tested live=$live dead=$dead")
+
+                if (!paused && searchScanToken == token && _search.value.scopeKey() == scopeKey) {
+                    _search.update { cur ->
+                        cur.copy(
+                            swarmScan = SwarmScanState(
+                                status = SwarmScanStatus.Completed,
+                                testedCount = tested,
+                                totalCount = allCandidates.size,
+                                verifiedLiveCount = live,
+                                deadCount = dead,
+                                currentHash = null,
+                            ),
+                        )
+                    }
+                }
+            } finally {
+                if (searchScanToken == token) {
+                    _search.update { cur ->
+                        cur.copy(
+                            probingHashes = cur.probingHashes - untestedHashes,
+                            swarmScan = if (cur.swarmScan.currentHash != null) cur.swarmScan.copy(currentHash = null) else cur.swarmScan,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun pauseSearchScan() {
+        searchScanToken++
+        searchScanJob?.cancel()
+        searchScanJob = null
+        _search.update { cur ->
+            if (cur.swarmScan.status == SwarmScanStatus.Running) {
+                cur.copy(swarmScan = cur.swarmScan.copy(status = SwarmScanStatus.Paused, currentHash = null))
+            } else {
+                cur
+            }
+        }
+    }
+
+    fun resumeSearchScan() {
+        if (_search.value.swarmScan.status == SwarmScanStatus.Paused) {
+            startProgressiveSearchScan(batchSize = lastScanBatchSize, ignoreCheckpoint = false)
+        }
+    }
+
+    fun startProgressiveDetailScan(batchSize: Int = lastScanBatchSize, ignoreCheckpoint: Boolean = false) {
+        lastScanBatchSize = batchSize.coerceIn(1, 10)
+        val runBatch = lastScanBatchSize
+        val prober = swarmDiagnostics ?: return
+        if (!prober.isAvailable) return
+        val detail = _discover.value.activeDetail ?: return
+        val cacheKey = detail.cacheKey
+        val season = detail.selectedSeason
+        val episode = detail.selectedEpisode
+        val sArg = if (detail.media.type == "series") season else null
+        val eArg = if (detail.media.type == "series") episode else null
+        val context = PlayabilityContext(
+            expectedDurationMinutes = PlayabilityContext.parseRuntimeMinutes(detail.media.runtime),
+            requestedSeason = sArg,
+            requestedEpisode = eArg,
+        )
+        val allCandidates = buildProgressiveScanCandidates(
+            results = detail.rawResults,
+            languageFilter = detail.languageFilter,
+            context = context,
+            scrapeStatsByHash = detail.swarmStatsByHash,
+            probeResultsByHash = detail.probeResultsByHash,
+        )
+        val existingProbes = allCandidates.mapNotNull { cand ->
+            cand.normalizedInfoHash?.let { detail.probeResultsByHash[it] }
+        }.filterNot { it.isPolicyBlocked }
+        val initialTested = existingProbes.size
+        val initialLive = existingProbes.count { it.isVerifiedLive }
+        val initialDead = existingProbes.count { it.isFailed }
+        val untested = allCandidates.filter { cand ->
+            val hash = cand.normalizedInfoHash ?: return@filter false
+            val existing = detail.probeResultsByHash[hash]
+            existing == null || existing.isPolicyBlocked
+        }
+        if (allCandidates.isEmpty()) {
+            updateActiveDetailIfMatch(cacheKey) { d ->
+                if (d.selectedSeason != season || d.selectedEpisode != episode) d
+                else d.copy(swarmScan = SwarmScanState())
+            }
+            return
+        }
+        if (untested.isEmpty()) {
+            updateActiveDetailIfMatch(cacheKey) { d ->
+                if (d.selectedSeason != season || d.selectedEpisode != episode) d
+                else d.copy(
+                    swarmScan = SwarmScanState(
+                        status = SwarmScanStatus.Completed,
+                        testedCount = initialTested,
+                        totalCount = allCandidates.size,
+                        verifiedLiveCount = initialLive,
+                        deadCount = initialDead,
+                    ),
+                )
+            }
+            return
+        }
+
+        val token = ++detailScanToken
+        detailScanJob?.cancel()
+        updateActiveDetailIfMatch(cacheKey) { d ->
+            if (d.selectedSeason != season || d.selectedEpisode != episode) d
+            else d.copy(
+                swarmScan = SwarmScanState(
+                    status = SwarmScanStatus.Running,
+                    testedCount = initialTested,
+                    totalCount = allCandidates.size,
+                    verifiedLiveCount = initialLive,
+                    deadCount = initialDead,
+                ),
+            )
+        }
+
+        val untestedHashes = untested.mapNotNull { it.normalizedInfoHash }.toSet()
+        detailScanJob = scope.launch {
+            var tested = initialTested
+            var live = initialLive
+            var dead = initialDead
+            var paused = false
+            var runTested = 0
+            try {
+                for (candidate in untested) {
+                    coroutineContext.ensureActive()
+                    val curDetail = _discover.value.activeDetail
+                    if (curDetail == null || curDetail.cacheKey != cacheKey || curDetail.selectedSeason != season || curDetail.selectedEpisode != episode) {
+                        return@launch
+                    }
+                    val hash = candidate.normalizedInfoHash ?: continue
+                    val alreadyProbed = curDetail.probeResultsByHash[hash]
+                    if (alreadyProbed != null && !alreadyProbed.isPolicyBlocked) continue
+
+                    updateActiveDetailIfMatch(cacheKey) { d ->
+                        if (d.selectedSeason != season || d.selectedEpisode != episode) d
+                        else d.copy(
+                            probingHashes = d.probingHashes + hash,
+                            swarmScan = d.swarmScan.copy(
+                                status = SwarmScanStatus.Running,
+                                currentHash = hash,
+                            ),
+                        )
+                    }
+
+                    val probed = runCatchingNonCancellation {
+                        prober.probeSingle(
+                            result = candidate,
+                            season = sArg,
+                            episode = eArg,
+                            forceRefresh = false,
+                            priority = ProbePriority.BACKGROUND_SCAN,
+                            profile = ProbeProfile.BACKGROUND_SCAN,
+                        )
+                    }.getOrNull()
+                    if (probed == null) {
+                        android.util.Log.w("ScanCoord", "scan probe returned null hash=${hash.take(8)}")
+                    }
+
+                    if (probed?.isPolicyBlocked == true) {
+                        updateActiveDetailIfMatch(cacheKey) { d ->
+                            if (d.selectedSeason != season || d.selectedEpisode != episode) {
+                                d.copy(probingHashes = d.probingHashes - hash)
+                            } else {
+                                d.copy(
+                                    probingHashes = d.probingHashes - hash,
+                                    swarmScan = d.swarmScan.copy(
+                                        status = SwarmScanStatus.Paused,
+                                        currentHash = null,
+                                    ),
+                                )
+                            }
+                        }
+                        paused = true
+                        break
+                    }
+
+                    tested++
+                    val isLive = probed?.isVerifiedLive == true
+                    if (isLive) live++ else dead++
+                    runTested++
+                    val hitCheckpoint = runTested >= runBatch && tested < allCandidates.size
+
+                    updateActiveDetailIfMatch(cacheKey) { d ->
+                        if (d.selectedSeason != season || d.selectedEpisode != episode) {
+                            d.copy(probingHashes = d.probingHashes - hash)
+                        } else {
+                            val nextMap = if (probed != null) d.probeResultsByHash + (probed.infoHash to probed) else d.probeResultsByHash
+                            d.copy(
+                                probeResultsByHash = nextMap,
+                                probingHashes = d.probingHashes - hash,
+                                swarmScan = SwarmScanState(
+                                    status = if (hitCheckpoint) SwarmScanStatus.Paused else SwarmScanStatus.Running,
+                                    testedCount = tested,
+                                    totalCount = allCandidates.size,
+                                    verifiedLiveCount = live,
+                                    deadCount = dead,
+                                    currentHash = null,
+                                ),
+                            )
+                        }
+                    }
+
+                    if (hitCheckpoint) {
+                        android.util.Log.i("ScanCoord", "scan checkpoint tested=$tested live=$live dead=$dead")
+                        paused = true
+                        break
+                    }
+                }
+                android.util.Log.i("ScanCoord", "scan loop end paused=$paused tested=$tested live=$live dead=$dead")
+
+                val curDetail = _discover.value.activeDetail
+                if (!paused &&
+                    detailScanToken == token &&
+                    curDetail != null &&
+                    curDetail.cacheKey == cacheKey &&
+                    curDetail.selectedSeason == season &&
+                    curDetail.selectedEpisode == episode
+                ) {
+                    updateActiveDetailIfMatch(cacheKey) { d ->
+                        d.copy(
+                            swarmScan = SwarmScanState(
+                                status = SwarmScanStatus.Completed,
+                                testedCount = tested,
+                                totalCount = allCandidates.size,
+                                verifiedLiveCount = live,
+                                deadCount = dead,
+                                currentHash = null,
+                            ),
+                        )
+                    }
+                }
+            } finally {
+                if (detailScanToken == token) {
+                    updateActiveDetailIfMatch(cacheKey) { d ->
+                        d.copy(
+                            probingHashes = d.probingHashes - untestedHashes,
+                            swarmScan = if (d.swarmScan.currentHash != null) d.swarmScan.copy(currentHash = null) else d.swarmScan,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun pauseDetailScan() {
+        detailScanToken++
+        detailScanJob?.cancel()
+        detailScanJob = null
+        val cacheKey = _discover.value.activeDetail?.cacheKey ?: return
+        updateActiveDetailIfMatch(cacheKey) { d ->
+            if (d.swarmScan.status == SwarmScanStatus.Running) {
+                d.copy(swarmScan = d.swarmScan.copy(status = SwarmScanStatus.Paused, currentHash = null))
+            } else {
+                d
+            }
+        }
+    }
+
+    fun resumeDetailScan() {
+        if (_discover.value.activeDetail?.swarmScan?.status == SwarmScanStatus.Paused) {
+            startProgressiveDetailScan(batchSize = lastScanBatchSize, ignoreCheckpoint = false)
+        }
+    }
+
+    fun measurePreparedSwarm(engineId: String, magnetOrHash: String?) {
+        val prober = swarmDiagnostics ?: return
+        if (!prober.isAvailable) return
+        val raw = magnetOrHash?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val hash = SearchUtils.extractInfoHash(raw)?.let {
+            SearchUtils.decodeInfoHashBytes(it)?.first ?: it.lowercase(Locale.ROOT)
+        } ?: SearchUtils.decodeInfoHashBytes(raw)?.first ?: return
+        val magnet = if (raw.startsWith("magnet:", ignoreCase = true)) raw else SearchUtils.buildMagnet(hash, "Swarm")
+        val synthetic = SearchUtils.makeResult(
+            providerId = "prepared",
+            providerName = "Prepared",
+            title = engineId,
+            magnetUri = magnet,
+        )
+        scope.launch {
+            _search.update { cur ->
+                if (cur.rawResults.any { it.normalizedInfoHash == hash }) {
+                    cur.copy(probingHashes = cur.probingHashes + hash)
+                } else {
+                    cur
+                }
+            }
+            _discover.value.activeDetail?.let { detail ->
+                if (detail.rawResults.any { it.normalizedInfoHash == hash }) {
+                    updateActiveDetailIfMatch(detail.cacheKey) { d ->
+                        d.copy(probingHashes = d.probingHashes + hash)
+                    }
+                }
+            }
+            val probed = try {
+                runCatchingNonCancellation {
+                    prober.probeSingle(
+                        result = synthetic,
+                        forceRefresh = true,
+                        priority = ProbePriority.USER_CLICK,
+                        profile = ProbeProfile.USER_CLICK,
+                    )
+                }.getOrNull()
+            } finally {
+                _search.update { cur -> cur.copy(probingHashes = cur.probingHashes - hash) }
+                _discover.value.activeDetail?.let { detail ->
+                    updateActiveDetailIfMatch(detail.cacheKey) { d ->
+                        d.copy(probingHashes = d.probingHashes - hash)
+                    }
+                }
+            }
+            if (probed != null) {
+                _search.update { cur ->
+                    cur.copy(probeResultsByHash = cur.probeResultsByHash + (probed.infoHash to probed))
+                }
+                _discover.value.activeDetail?.let { detail ->
+                    updateActiveDetailIfMatch(detail.cacheKey) { d ->
+                        d.copy(probeResultsByHash = d.probeResultsByHash + (probed.infoHash to probed))
+                    }
+                }
+            }
+        }
+    }
+
+    private fun buildProgressiveScanCandidates(
+        results: List<TorrentSearchResult>,
+        languageFilter: SearchLanguageFilter,
+        context: PlayabilityContext,
+        scrapeStatsByHash: Map<String, org.cinito.online.search.TrackerSwarmStats>,
+        probeResultsByHash: Map<String, SwarmProbeResult>,
+    ): List<TorrentSearchResult> {
+        val (sorted, _) = SearchService.evaluatePlayabilityAndSort(
+            results = results,
+            sortOrder = SearchSortOrder.BestPlayability,
+            languageFilter = languageFilter,
+            playabilityContext = context,
+            scrapeStatsByHash = scrapeStatsByHash,
+            probeResultsByHash = probeResultsByHash,
+        )
+        return sorted
+            .filter { it.normalizedInfoHash != null }
+            .distinctBy { it.normalizedInfoHash }
     }
 
     private fun selectTopProbeCandidates(
@@ -1309,6 +1951,8 @@ class ExploreCoordinator(
         episode: Int?,
         targets: List<TorrentSearchResult>,
         forceRefresh: Boolean = false,
+        priority: ProbePriority = ProbePriority.USER_CLICK,
+        profile: ProbeProfile = ProbeProfile.USER_CLICK,
     ) {
         val hashes = targets.mapNotNull { it.normalizedInfoHash }.toSet()
         if (hashes.isEmpty()) return
@@ -1325,7 +1969,14 @@ class ExploreCoordinator(
                         else d.copy(probingHashes = d.probingHashes + hash)
                     }
                     val probed = runCatchingNonCancellation {
-                        prober.probeSingle(candidate, season = sArg, episode = eArg, forceRefresh = forceRefresh)
+                        prober.probeSingle(
+                            result = candidate,
+                            season = sArg,
+                            episode = eArg,
+                            forceRefresh = forceRefresh,
+                            priority = priority,
+                            profile = profile,
+                        )
                     }.getOrNull()
                     updateActiveDetailIfMatch(cacheKey) { d ->
                         if (d.selectedSeason != season || d.selectedEpisode != episode) {
@@ -1356,6 +2007,8 @@ class ExploreCoordinator(
         episode: Int?,
         targets: List<TorrentSearchResult>,
         forceRefresh: Boolean = false,
+        priority: ProbePriority = ProbePriority.USER_CLICK,
+        profile: ProbeProfile = ProbeProfile.USER_CLICK,
     ) {
         val hashes = targets.mapNotNull { it.normalizedInfoHash }.toSet()
         if (hashes.isEmpty()) return
@@ -1369,7 +2022,14 @@ class ExploreCoordinator(
                         if (cur.scopeKey() != scopeKey) cur else cur.copy(probingHashes = cur.probingHashes + hash)
                     }
                     val probed = runCatchingNonCancellation {
-                        prober.probeSingle(candidate, season = season, episode = episode, forceRefresh = forceRefresh)
+                        prober.probeSingle(
+                            result = candidate,
+                            season = season,
+                            episode = episode,
+                            forceRefresh = forceRefresh,
+                            priority = priority,
+                            profile = profile,
+                        )
                     }.getOrNull()
                     _search.update { cur ->
                         if (cur.scopeKey() != scopeKey) {
@@ -1400,7 +2060,8 @@ class ExploreCoordinator(
             if (snapshot.isEmpty()) return@launch
             _search.update { if (it.scopeKey() == scopeKey) it.copy(isScrapingSwarm = true) else it }
             try {
-                val stats = runCatchingNonCancellation { udpScraper.scrapeBatch(snapshot, maxItems = 15) }
+                val scrapeCandidates = snapshot.sortedByDescending { it.seeders }
+                val stats = runCatchingNonCancellation { udpScraper.scrapeBatch(scrapeCandidates, maxItems = 40) }
                     .getOrDefault(emptyMap())
                 var stillMatches = false
                 _search.update { cur ->
@@ -1459,7 +2120,10 @@ class ExploreCoordinator(
             Result.failure(t)
         }
 
+    private var lastScanBatchSize = 5
+
     companion object {
         private const val DISCOVER_IN_MEMORY_TTL_MS = 4L * 3600L * 1000L
+        private const val PROGRESSIVE_SCAN_CHECKPOINT = 5
     }
 }

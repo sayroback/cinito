@@ -23,7 +23,7 @@ import java.util.concurrent.ConcurrentHashMap
 open class UdpTrackerScraper(
     private val trackerUrlsProvider: () -> List<String> = { SearchUtils.DEFAULT_TRACKERS },
     private val dnsResolver: (String) -> InetAddress = { host -> InetAddress.getByName(host) },
-    private val timeoutMs: Int = 1_400,
+    private val timeoutMs: Int = 2_200,
     private val cacheTtlMs: Long = 10 * 60 * 1_000L,
     private val clockMs: () -> Long = { System.currentTimeMillis() },
     private val allowLoopbackForTest: Boolean = false,
@@ -34,7 +34,7 @@ open class UdpTrackerScraper(
 
     open suspend fun scrapeBatch(
         results: List<TorrentSearchResult>,
-        maxItems: Int = 15,
+        maxItems: Int = 40,
     ): Map<String, TrackerSwarmStats> = withContext(Dispatchers.IO) {
         if (results.isEmpty() || maxItems <= 0) return@withContext emptyMap()
 
@@ -64,7 +64,7 @@ open class UdpTrackerScraper(
         val trackers = trackerUrlsProvider()
             .filter { it.startsWith("udp://", ignoreCase = true) }
             .distinct()
-            .take(3)
+            .take(5)
         if (trackers.isEmpty()) return@withContext output
 
         val orderedHashes = toQuery.keys.toList()

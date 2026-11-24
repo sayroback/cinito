@@ -7,6 +7,7 @@ import org.cinito.online.metadata.MediaEpisode
 import org.cinito.online.metadata.MediaMetadata
 import org.cinito.online.metadata.MediaTitleParser
 import org.cinito.online.search.PlayabilityAssessment
+import org.cinito.online.search.PlayabilityScorer
 import org.cinito.online.search.PlayabilityVerdict
 import org.cinito.online.search.ProviderFailure
 import org.cinito.online.search.SearchCategory
@@ -34,6 +35,22 @@ data class CatalogSourceQuery(
     val season: Int?,
     val episode: Int?,
 )
+
+enum class SwarmScanStatus { Idle, Running, Paused, Completed }
+
+data class SwarmScanState(
+    val status: SwarmScanStatus = SwarmScanStatus.Idle,
+    val testedCount: Int = 0,
+    val totalCount: Int = 0,
+    val verifiedLiveCount: Int = 0,
+    val deadCount: Int = 0,
+    val currentHash: String? = null,
+) {
+    val done: Int get() = testedCount
+    val total: Int get() = totalCount
+    val ok: Int get() = verifiedLiveCount
+    val dead: Int get() = deadCount
+}
 
 data class EpisodeSourcesSnapshot(
     val rawResults: List<TorrentSearchResult> = emptyList(),
@@ -69,6 +86,7 @@ data class CatalogDetailState(
     val episodeSnapshots: Map<String, EpisodeSourcesSnapshot> = emptyMap(),
     val scrollIndex: Int = 0,
     val scrollOffset: Int = 0,
+    val swarmScan: SwarmScanState = SwarmScanState(),
 ) {
     fun episodeSnapshotKey(season: Int = selectedSeason, episode: Int? = selectedEpisode): String =
         "$season:${episode ?: -1}"
@@ -146,10 +164,17 @@ data class SearchUiState(
     val probingHashes: Set<String> = emptySet(),
     val enrichingIds: Set<String> = emptySet(),
     val originCatalogTitle: String? = null,
+    val hideDeadResults: Boolean = true,
     val scrollIndex: Int = 0,
     val scrollOffset: Int = 0,
+    val swarmScan: SwarmScanState = SwarmScanState(),
 ) {
-    fun scopeKey(lang: SearchLanguageFilter = languageFilter): String =
+    fun scopeKey(
+        lang: SearchLanguageFilter = languageFilter,
+        broadGeneralSearch: Boolean = false,
+        hideAdultContent: Boolean = true,
+        adultOnly: Boolean = false,
+    ): String =
         listOf(
             submittedQuery.trim().lowercase(Locale.ROOT),
             activeAlternateQuery?.trim()?.lowercase(Locale.ROOT).orEmpty(),
@@ -158,6 +183,9 @@ data class SearchUiState(
             lang.name,
             activeSeasonHint?.toString().orEmpty(),
             activeEpisodeHint?.toString().orEmpty(),
+            broadGeneralSearch.toString(),
+            hideAdultContent.toString(),
+            adultOnly.toString(),
         ).joinToString("|")
 }
 
@@ -513,6 +541,23 @@ fun pickBestAutoStreamResult(
     val cleanReleases = liveNonDead.filterNot { CAM_RELEASE_REGEX.containsMatchIn(it.title) }
         .ifEmpty { liveNonDead }
     return cleanReleases.firstOrNull()
+}
+
+data class FilteredSearchResults(
+    val visible: List<TorrentSearchResult>,
+    val hiddenDeadCount: Int,
+)
+
+fun filterSearchPlayableResults(
+    results: List<TorrentSearchResult>,
+    assessments: Map<String, PlayabilityAssessment>,
+    hideDeadResults: Boolean,
+): FilteredSearchResults {
+    if (!hideDeadResults) return FilteredSearchResults(results, 0)
+    val (dead, live) = results.partition {
+        (assessments[it.id]?.verdict ?: PlayabilityScorer.evaluate(it).verdict) == PlayabilityVerdict.Dead
+    }
+    return FilteredSearchResults(visible = live, hiddenDeadCount = dead.size)
 }
 
 private fun normalizeCatalogTitle(raw: String): String =

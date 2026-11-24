@@ -118,6 +118,7 @@ fun PlayerTopBar(
     castConnected: Boolean,
     isLandscape: Boolean,
     isSavedInLibrary: Boolean = false,
+    p2pTelemetryLabel: String? = null,
     onSaveToLibrary: (() -> Unit)? = null,
     onBack: () -> Unit,
     onOpenCast: () -> Unit,
@@ -156,14 +157,31 @@ fun PlayerTopBar(
                 overflow = TextOverflow.Ellipsis,
             )
             val subtitle = formattedTitle.episodeBadge ?: formattedTitle.secondaryTag
-            if (subtitle != null) {
-                Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.bodySmall.tabular(),
-                    color = CinemaColors.TextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+            if (subtitle != null || p2pTelemetryLabel != null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (subtitle != null) {
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.bodySmall.tabular(),
+                            color = CinemaColors.TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                    }
+                    if (p2pTelemetryLabel != null) {
+                        Text(
+                            text = p2pTelemetryLabel,
+                            style = MaterialTheme.typography.labelSmall.tabular(),
+                            color = CinemaColors.TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
             }
         }
 

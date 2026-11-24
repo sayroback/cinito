@@ -1538,7 +1538,7 @@ impl PlaybackSession {
         let (piece_length, begin, end) = (self.piece_length, self.begin_piece, self.end_piece);
         // Direct Play keeps pieces in RAM only: a quarter of it for keyframes.
         let max_bytes = ram_budget.map_or(SEEK_FETCH_DISK_BYTES, |budget| budget / 4);
-        let _ = std::thread::Builder::new().name("wt-seek-index".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("wt-seek-index".into()).spawn(move || {
             let read = |abs: i64, len: i64| host.read_verified(&id, file_start + abs, len);
             for _ in 0..SEEK_INDEX_ATTEMPTS {
                 if host.is_shutting_down() {
@@ -1559,6 +1559,9 @@ impl PlaybackSession {
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
+        if let Err(err) = spawned {
+            crate::jni::log_warn(&format!("seek index thread spawn failed: {err}"));
+        }
     }
 
     pub fn close(&mut self) {

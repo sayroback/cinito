@@ -2,6 +2,7 @@ package org.cinito.online.search
 
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -368,7 +369,7 @@ class SearchServiceTest {
             assertEquals(AudioLanguageTag.Castellano, cast.languageTag)
 
             val recorded = server.takeRequest()
-            assertEquals("/language=latino/stream/movie/tt2056785.json", recorded.path)
+            assertEquals("/sort=seeders%7Cqualityfilter=scr,cam%7Clanguage=latino/stream/movie/tt2056785.json", recorded.path)
         } finally {
             server.shutdown()
         }
@@ -764,7 +765,7 @@ class SearchServiceTest {
     }
 
     @Test
-    fun tpbSeriesUsesVideoCategoryToIncludeHdTvAndTorrentioSkipsPackWithNullEpisode() = runTest {
+    fun tpbSeriesUsesVideoCategoryToIncludeHdTvAndTorrentioSkipsPackWithNullEpisode() = runBlocking {
         val server = MockWebServer()
         server.enqueue(
             MockResponse().setBody(
@@ -798,7 +799,7 @@ class SearchServiceTest {
             val tpb = ThePirateBayProvider(HardenedNetworkClient(DohProvider.System), apiBaseUrl = base)
             val seriesHits = tpb.search("Breaking Bad", SearchCategory.Series)
             val req = server.takeRequest()
-            assertTrue("Expected cat=200 to include HD TV 208, got ${req.path}", req.path?.contains("cat=200") == true)
+            assertTrue("Expected cat=205,208 for TV, got ${req.path}", req.path?.contains("cat=205,208") == true)
             assertEquals(1, seriesHits.size)
             assertEquals("101", seriesHits.first().sourceRecordId)
 
@@ -814,5 +815,693 @@ class SearchServiceTest {
         } finally {
             server.shutdown()
         }
+    }
+
+    @Test
+    fun broadGeneralSearchAndAdultFilterControlTpbAndSearchServiceResults() = runBlocking {
+        val server = MockWebServer()
+        val body = """
+            [
+              {
+                "id": "201",
+                "name": "Blender Open Movie Big Buck Bunny 1080p",
+                "info_hash": "3333333333333333333333333333333333333333",
+                "seeders": "45",
+                "leechers": "2",
+                "size": "1200000000",
+                "category": "299"
+              },
+              {
+                "id": "202",
+                "name": "Sample Adult XXX Pack 1080p",
+                "info_hash": "4444444444444444444444444444444444444444",
+                "seeders": "99",
+                "leechers": "10",
+                "size": "2500000000",
+                "category": "501"
+              }
+            ]
+        """.trimIndent()
+        server.enqueue(MockResponse().setBody(body))
+        server.enqueue(MockResponse().setBody(body))
+        server.start()
+        try {
+            val base = server.url("").toString().trimEnd('/')
+            val tpb = ThePirateBayProvider(HardenedNetworkClient(DohProvider.System), apiBaseUrl = base)
+
+            val restricted = tpb.search(
+                query = "bunny",
+                category = SearchCategory.All,
+                options = SearchRequestOptions(broadGeneralSearch = false, hideAdultContent = true),
+            )
+            val reqRestricted = server.takeRequest()
+            assertTrue(
+                "Expected non-CAM video categories when broadGeneralSearch=false, got ${reqRestricted.path}",
+                reqRestricted.path?.contains("cat=201,202,203,204,205,207,208,209,299") == true,
+            )
+            assertEquals(1, restricted.size)
+            assertEquals("201", restricted.first().sourceRecordId)
+
+            val broadNoFilter = tpb.search(
+                query = "bunny",
+                category = SearchCategory.All,
+                options = SearchRequestOptions(broadGeneralSearch = true, hideAdultContent = false),
+            )
+            val reqBroad = server.takeRequest()
+            assertTrue("Expected cat=0 when broadGeneralSearch=true, got ${reqBroad.path}", reqBroad.path?.contains("cat=0") == true)
+            assertEquals(2, broadNoFilter.size)
+
+            val fakeGeneral = FakeProvider(
+                SearchProviderInfo("solidtorrents", "SolidTorrents", "https://solidtorrents.to", setOf(SearchCategory.Movies, SearchCategory.Other)),
+            ) {
+                listOf(
+                    SearchUtils.makeResult(
+                        providerId = "solidtorrents",
+                        providerName = "SolidTorrents",
+                        title = "Documentary Nature 4K",
+                        magnetUri = SearchUtils.buildMagnet("5555555555555555555555555555555555555555", "Nature"),
+                        seeders = 20,
+                    ),
+                    SearchUtils.makeResult(
+                        providerId = "solidtorrents",
+                        providerName = "SolidTorrents",
+                        title = "Hentai OVA Uncensored 1080p",
+                        magnetUri = SearchUtils.buildMagnet("6666666666666666666666666666666666666666", "Hentai"),
+                        seeders = 30,
+                    ),
+                )
+            }
+            val service = SearchService(listOf(fakeGeneral))
+            val safeOnly = service.searchStreaming(
+                query = "nature",
+                category = SearchCategory.All,
+                enabledProviderIds = setOf("solidtorrents"),
+                torznabConfigs = emptyList(),
+                languageFilter = SearchLanguageFilter.AllLanguages,
+                broadGeneralSearch = true,
+                hideAdultContent = true,
+            ).toList().last()
+            assertEquals(1, safeOnly.results.size)
+            assertEquals("Documentary Nature 4K", safeOnly.results.first().title)
+
+            val unfiltered = service.searchStreaming(
+                query = "nature",
+                category = SearchCategory.All,
+                enabledProviderIds = setOf("solidtorrents"),
+                torznabConfigs = emptyList(),
+                languageFilter = SearchLanguageFilter.AllLanguages,
+                broadGeneralSearch = true,
+                hideAdultContent = false,
+            ).toList().last()
+            assertEquals(2, unfiltered.results.size)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun adultOnlyModeExcludesMovieProvidersSkipsTitleResolverAndFiltersToAdultOnly() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setBody(
+                """
+                [
+                  {
+                    "id": "301",
+                    "name": "Regular Action Movie 2024 1080p",
+                    "info_hash": "7777777777777777777777777777777777777777",
+                    "seeders": "80",
+                    "leechers": "5",
+                    "size": "2000000000",
+                    "category": "207"
+                  },
+                  {
+                    "id": "302",
+                    "name": "Studio Release 2024 1080p",
+                    "info_hash": "8888888888888888888888888888888888888888",
+                    "seeders": "60",
+                    "leechers": "4",
+                    "size": "1500000000",
+                    "category": "501"
+                  }
+                ]
+                """.trimIndent(),
+            ),
+        )
+        server.start()
+        try {
+            val base = server.url("").toString().trimEnd('/')
+            val tpb = ThePirateBayProvider(HardenedNetworkClient(DohProvider.System), apiBaseUrl = base)
+            var movieProviderCalled = false
+            val fakeMovies = FakeProvider(
+                SearchProviderInfo("yts", "YTS", "https://yts.bz", setOf(SearchCategory.Movies), supportsAdultContent = false),
+            ) {
+                movieProviderCalled = true
+                listOf(
+                    SearchUtils.makeResult(
+                        providerId = "yts",
+                        providerName = "YTS",
+                        title = "Movie From YTS 2024",
+                        magnetUri = SearchUtils.buildMagnet("9999999999999999999999999999999999999999", "YTS"),
+                        seeders = 100,
+                    ),
+                )
+            }
+            val fakeGeneral = FakeProvider(
+                SearchProviderInfo("solidtorrents", "SolidTorrents", "https://solidtorrents.to", setOf(SearchCategory.Movies, SearchCategory.Adult), supportsAdultContent = true, hasStrictAdultCategory = false),
+            ) {
+                listOf(
+                    SearchUtils.makeResult(
+                        providerId = "solidtorrents",
+                        providerName = "SolidTorrents",
+                        title = "Normal Documentary 1080p",
+                        magnetUri = SearchUtils.buildMagnet("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Doc"),
+                        seeders = 40,
+                    ),
+                    SearchUtils.makeResult(
+                        providerId = "solidtorrents",
+                        providerName = "SolidTorrents",
+                        title = "Adult XXX Scene 1080p",
+                        magnetUri = SearchUtils.buildMagnet("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "XXX"),
+                        seeders = 50,
+                    ),
+                )
+            }
+            var resolverCalled = false
+            val service = SearchService(
+                builtinProviders = listOf(tpb, fakeMovies, fakeGeneral),
+                titleResolver = { _, _ ->
+                    resolverCalled = true
+                    SearchTitleResolution("Resolved", "Resolved", 2024, "tt1234567")
+                },
+            )
+            val batch = service.searchStreaming(
+                query = "test",
+                category = SearchCategory.All,
+                enabledProviderIds = setOf("thepiratebay", "yts", "solidtorrents"),
+                torznabConfigs = emptyList(),
+                languageFilter = SearchLanguageFilter.AllLanguages,
+                hideAdultContent = false,
+                adultOnly = true,
+            ).toList().last()
+
+            assertFalse("Movie-only provider must not be called in adultOnly mode", movieProviderCalled)
+            assertFalse("Title resolver must be skipped in adultOnly mode", resolverCalled)
+            val tpbReq = server.takeRequest()
+            assertTrue("Expected TPB cat=500 in adultOnly mode, got ${tpbReq.path}", tpbReq.path?.contains("cat=500") == true)
+            assertEquals(
+                "Results=${batch.results.map { "${it.providerId}:${it.title}" }}, failures=${batch.failures}",
+                2,
+                batch.results.size,
+            )
+            assertTrue(batch.results.any { it.sourceRecordId == "302" })
+            assertTrue(batch.results.any { it.title == "Adult XXX Scene 1080p" })
+            assertFalse(batch.results.any { it.title == "Normal Documentary 1080p" })
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun adultOnlyModeBypassesOnlyLatinoLanguageFilter() = runTest {
+        val provider = FakeProvider(
+            SearchProviderInfo(
+                id = "thepiratebay",
+                name = "ThePirateBay",
+                url = "https://thepiratebay.org",
+                categories = setOf(SearchCategory.Adult),
+                supportsAdultContent = true,
+                hasStrictAdultCategory = true,
+            ),
+        ) {
+            listOf(
+                SearchUtils.makeResult(
+                    providerId = "thepiratebay",
+                    providerName = "ThePirateBay",
+                    title = "Studio Release 2024 1080p",
+                    magnetUri = SearchUtils.buildMagnet("cccccccccccccccccccccccccccccccccccccccc", "Studio"),
+                    seeders = 75,
+                    category = SearchCategory.Adult,
+                ),
+            )
+        }
+        val service = SearchService(listOf(provider))
+        val batch = service.searchStreaming(
+            query = "studio",
+            category = SearchCategory.Adult,
+            enabledProviderIds = setOf("thepiratebay"),
+            torznabConfigs = emptyList(),
+            languageFilter = SearchLanguageFilter.OnlyLatino,
+            hideAdultContent = false,
+            adultOnly = true,
+        ).toList().last()
+
+        assertEquals(1, batch.results.size)
+        assertEquals(AudioLanguageTag.Other, batch.results.first().languageTag)
+    }
+
+    @Test
+    fun adultOnlyModePreservesTorznabAdultCategoryResultsWithoutTitleKeywords() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setBody(
+                """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+                  <channel>
+                    <item>
+                      <title>Studio Release 2024 1080p</title>
+                      <torznab:attr name="infohash" value="dddddddddddddddddddddddddddddddddddddddd"/>
+                      <torznab:attr name="category" value="6000"/>
+                      <torznab:attr name="seeders" value="42"/>
+                      <torznab:attr name="peers" value="3"/>
+                    </item>
+                    <item>
+                      <title>Regular Documentary 2024 1080p</title>
+                      <torznab:attr name="infohash" value="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"/>
+                      <torznab:attr name="category" value="2000"/>
+                      <torznab:attr name="seeders" value="99"/>
+                    </item>
+                  </channel>
+                </rss>
+                """.trimIndent(),
+            ),
+        )
+        server.start()
+        try {
+            val base = server.url("").toString().trimEnd('/')
+            val client = HardenedNetworkClient(DohProvider.System)
+            val service = SearchService(
+                builtinProviders = emptyList(),
+                torznabFactory = { cfg -> TorznabSearchProvider(cfg, client) },
+            )
+            val cfg = TorznabConfig(
+                id = "torznab-1",
+                name = "Mi Indexer",
+                url = base,
+                apiKey = "test-key",
+                categories = setOf(SearchCategory.Movies, SearchCategory.Adult),
+            )
+            val batch = service.searchStreaming(
+                query = "studio",
+                category = SearchCategory.Adult,
+                enabledProviderIds = emptySet(),
+                torznabConfigs = listOf(cfg),
+                languageFilter = SearchLanguageFilter.OnlyLatino,
+                hideAdultContent = false,
+                adultOnly = true,
+            ).toList().last()
+
+            val req = server.takeRequest()
+            assertTrue("Expected Torznab cat=6000, got ${req.path}", req.path?.contains("cat=6000") == true)
+            assertEquals(1, batch.results.size)
+            assertEquals("Studio Release 2024 1080p", batch.results.first().title)
+            assertEquals(SearchCategory.Adult, batch.results.first().category)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun adultOnlyModeExcludesNonStrictProvidersAndQueriesOnlyStrictAdultProviders() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setBody(
+                """
+                {
+                  "success": true,
+                  "results": [
+                    {
+                      "id": "10",
+                      "infohash": "1111111111111111111111111111111111111111",
+                      "title": "Studio Release 2024 1080p",
+                      "size": 1500000000,
+                      "category": 10,
+                      "seeders": 88,
+                      "leechers": 7
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            ),
+        )
+        server.start()
+        try {
+            val base = server.url("").toString().trimEnd('/')
+            val client = HardenedNetworkClient(DohProvider.System)
+            val lime = LimeTorrentsProvider(client, baseUrl = base)
+            val bitSearch = BitSearchProvider(client, baseUrl = base)
+            val csv = TorrentsCsvProvider(client)
+            val solid = SolidTorrentsProvider(client, baseUrl = base)
+
+            assertFalse(lime.info.supportsAdultContent)
+            assertFalse(bitSearch.info.supportsAdultContent)
+            assertFalse(csv.info.supportsAdultContent)
+            assertTrue(solid.info.supportsAdultContent)
+            assertTrue(solid.info.hasStrictAdultCategory)
+
+            val service = SearchService(listOf(lime, bitSearch, csv, solid))
+            val batch = service.searchStreaming(
+                query = "studio",
+                category = SearchCategory.All,
+                enabledProviderIds = setOf("limetorrents", "bitsearch", "torrentscsv", "solidtorrents"),
+                torznabConfigs = emptyList(),
+                languageFilter = SearchLanguageFilter.AllLanguages,
+                hideAdultContent = false,
+                adultOnly = true,
+            ).toList().last()
+
+            assertEquals(1, server.requestCount)
+            val req = server.takeRequest()
+            assertTrue("Expected SolidTorrents category=10, got ${req.path}", req.path?.contains("category=10") == true)
+            assertEquals(1, batch.results.size)
+            assertEquals("solidtorrents", batch.results.first().providerId)
+            assertEquals(SearchCategory.Adult, batch.results.first().category)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun solidTorrentsProviderUsesCategory10InAdultOnlyMode() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setBody(
+                """
+                {
+                  "success": true,
+                  "results": [
+                    {
+                      "id": "10",
+                      "infohash": "1111111111111111111111111111111111111111",
+                      "title": "Studio Release 2024 1080p",
+                      "size": 1500000000,
+                      "category": 10,
+                      "seeders": 88,
+                      "leechers": 7
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            ),
+        )
+        server.start()
+        try {
+            val base = server.url("").toString().trimEnd('/')
+            val provider = SolidTorrentsProvider(HardenedNetworkClient(DohProvider.System), baseUrl = base)
+            val adultOptions = SearchRequestOptions(hideAdultContent = false, adultOnly = true)
+            val hits = provider.search("studio", SearchCategory.All, adultOptions)
+
+            val req = server.takeRequest()
+            assertTrue("Expected category=10 in path, got ${req.path}", req.path?.contains("category=10") == true)
+            assertTrue("Expected no xxx appended, got ${req.path}", req.path?.contains("q=studio&") == true)
+            assertEquals(1, hits.size)
+            assertEquals(SearchCategory.Adult, hits.first().category)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun sukebeiProviderParsesAdultRssAndBlocksLeakWhenHideAdultContentEnabled() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setBody(
+                """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <rss version="2.0" xmlns:nyaa="https://sukebei.nyaa.si/xmlns/nyaa">
+                  <channel>
+                    <item>
+                      <title>[Studio] Sample Release 1080p</title>
+                      <guid>https://sukebei.nyaa.net/view/12345</guid>
+                      <nyaa:infoHash>2222222222222222222222222222222222222222</nyaa:infoHash>
+                      <nyaa:size>1.4 GiB</nyaa:size>
+                      <nyaa:seeders>45</nyaa:seeders>
+                      <nyaa:leechers>6</nyaa:leechers>
+                    </item>
+                  </channel>
+                </rss>
+                """.trimIndent(),
+            ),
+        )
+        server.start()
+        try {
+            val base = server.url("").toString().trimEnd('/')
+            val provider = SukebeiProvider(HardenedNetworkClient(DohProvider.System), baseUrl = base)
+
+            val blockedInAll = provider.search(
+                "sample",
+                SearchCategory.All,
+                SearchRequestOptions(hideAdultContent = true, adultOnly = false),
+            )
+            assertTrue("Sukebei must not query or return results in All when hideAdultContent=true", blockedInAll.isEmpty())
+            assertEquals(0, server.requestCount)
+
+            val blockedInMovies = provider.search(
+                "sample",
+                SearchCategory.Movies,
+                SearchRequestOptions(hideAdultContent = false, adultOnly = false),
+            )
+            assertTrue(blockedInMovies.isEmpty())
+            assertEquals(0, server.requestCount)
+
+            val adultHits = provider.search(
+                "sample",
+                SearchCategory.All,
+                SearchRequestOptions(hideAdultContent = false, adultOnly = true),
+            )
+            val req = server.takeRequest()
+            assertTrue("Expected Sukebei RSS query, got ${req.path}", req.path?.contains("page=rss") == true)
+            assertEquals(1, adultHits.size)
+            assertEquals(SearchCategory.Adult, adultHits.first().category)
+            assertEquals(45, adultHits.first().seeders)
+            assertEquals("2222222222222222222222222222222222222222", adultHits.first().infoHash)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun theRarBgProviderUsesCat6000InAdultModeAndFiltersHideAdultContent() = runBlocking {
+        val server = MockWebServer()
+        val torznabBody = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+              <channel>
+                <item>
+                  <title>Adult Studio Release 1080p</title>
+                  <torznab:attr name="infohash" value="3333333333333333333333333333333333333333"/>
+                  <torznab:attr name="category" value="6000"/>
+                  <torznab:attr name="seeders" value="30"/>
+                  <torznab:attr name="peers" value="4"/>
+                </item>
+                <item>
+                  <title>Regular Nature Movie 2024 1080p</title>
+                  <torznab:attr name="infohash" value="4444444444444444444444444444444444444444"/>
+                  <torznab:attr name="category" value="2000"/>
+                  <torznab:attr name="seeders" value="90"/>
+                </item>
+              </channel>
+            </rss>
+        """.trimIndent()
+        server.enqueue(MockResponse().setBody(torznabBody))
+        server.enqueue(MockResponse().setBody(torznabBody))
+        server.start()
+        try {
+            val base = server.url("").toString().trimEnd('/')
+            val provider = TheRarBgProvider(HardenedNetworkClient(DohProvider.System), baseUrl = base)
+
+            val adultHits = provider.search(
+                "studio",
+                SearchCategory.All,
+                SearchRequestOptions(hideAdultContent = false, adultOnly = true),
+            )
+            val adultReq = server.takeRequest()
+            assertTrue("Expected cat=6000 in adultOnly mode, got ${adultReq.path}", adultReq.path?.contains("cat=6000") == true)
+            assertEquals(1, adultHits.size)
+            assertEquals(SearchCategory.Adult, adultHits.first().category)
+
+            val safeHits = provider.search(
+                "nature",
+                SearchCategory.Movies,
+                SearchRequestOptions(hideAdultContent = true, adultOnly = false),
+            )
+            val safeReq = server.takeRequest()
+            assertTrue("Expected cat=2000 in Movies mode, got ${safeReq.path}", safeReq.path?.contains("cat=2000") == true)
+            assertEquals(1, safeHits.size)
+            assertEquals(SearchCategory.Movies, safeHits.first().category)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun disabledAdultProviderIdsExcludesSelectedProviderOnlyInAdultMode() = runTest {
+        var tpbCalls = 0
+        var solidCalls = 0
+
+        val tpb = object : TorrentSearchProvider {
+            override val info = SearchProviderInfo(
+                id = "thepiratebay",
+                name = "ThePirateBay",
+                url = "https://thepiratebay.org",
+                categories = setOf(SearchCategory.Movies, SearchCategory.Adult),
+                supportsAdultContent = true,
+                hasStrictAdultCategory = true,
+            )
+
+            override suspend fun search(query: String, category: SearchCategory) = emptyList<TorrentSearchResult>()
+
+            override suspend fun search(
+                query: String,
+                category: SearchCategory,
+                options: SearchRequestOptions,
+            ): List<TorrentSearchResult> {
+                tpbCalls++
+                return listOf(
+                    SearchUtils.makeResult(
+                        providerId = info.id,
+                        providerName = info.name,
+                        title = "TPB Release 2024 1080p",
+                        magnetUri = SearchUtils.buildMagnet("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "TPB"),
+                        seeders = 50,
+                        category = if (options.adultOnly) SearchCategory.Adult else SearchCategory.Movies,
+                    ),
+                )
+            }
+        }
+
+        val solid = object : TorrentSearchProvider {
+            override val info = SearchProviderInfo(
+                id = "solidtorrents",
+                name = "SolidTorrents",
+                url = "https://solidtorrents.to",
+                categories = setOf(SearchCategory.Movies, SearchCategory.Adult),
+                supportsAdultContent = true,
+                hasStrictAdultCategory = true,
+            )
+
+            override suspend fun search(query: String, category: SearchCategory) = emptyList<TorrentSearchResult>()
+
+            override suspend fun search(
+                query: String,
+                category: SearchCategory,
+                options: SearchRequestOptions,
+            ): List<TorrentSearchResult> {
+                solidCalls++
+                return listOf(
+                    SearchUtils.makeResult(
+                        providerId = info.id,
+                        providerName = info.name,
+                        title = "Solid Release 2024 1080p",
+                        magnetUri = SearchUtils.buildMagnet("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Solid"),
+                        seeders = 60,
+                        category = if (options.adultOnly) SearchCategory.Adult else SearchCategory.Movies,
+                    ),
+                )
+            }
+        }
+
+        val service = SearchService(listOf(tpb, solid))
+
+        val adultBatch = service.searchStreaming(
+            query = "studio",
+            category = SearchCategory.All,
+            enabledProviderIds = setOf("thepiratebay", "solidtorrents"),
+            torznabConfigs = emptyList(),
+            languageFilter = SearchLanguageFilter.AllLanguages,
+            hideAdultContent = false,
+            adultOnly = true,
+            disabledAdultProviderIds = setOf("thepiratebay"),
+        ).toList().last()
+
+        assertEquals(0, tpbCalls)
+        assertEquals(1, solidCalls)
+        assertEquals(listOf("solidtorrents"), adultBatch.results.map { it.providerId })
+
+        tpbCalls = 0
+        solidCalls = 0
+
+        val moviesBatch = service.searchStreaming(
+            query = "studio",
+            category = SearchCategory.Movies,
+            enabledProviderIds = setOf("thepiratebay", "solidtorrents"),
+            torznabConfigs = emptyList(),
+            languageFilter = SearchLanguageFilter.AllLanguages,
+            hideAdultContent = false,
+            adultOnly = false,
+            disabledAdultProviderIds = setOf("thepiratebay"),
+        ).toList().last()
+
+        assertEquals(1, tpbCalls)
+        assertEquals(1, solidCalls)
+        assertEquals(setOf("thepiratebay", "solidtorrents"), moviesBatch.results.map { it.providerId }.toSet())
+    }
+
+    @Test
+    fun bestPlayabilityPrioritizeLatinoRanksVerifiedFlowAboveUntestedLatinoAndVerifiedLatinoAboveVerifiedOther() {
+        val hashUntestedLatino = "1111111111111111111111111111111111111111"
+        val hashVerifiedOther = "2222222222222222222222222222222222222222"
+        val hashVerifiedLatino = "3333333333333333333333333333333333333333"
+
+        val untestedLatino = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Movie.2025.1080p.WEB-DL.Latino",
+            magnetUri = SearchUtils.buildMagnet(hashUntestedLatino, "UntestedLatino"),
+            sizeBytes = 2L * 1024L * 1024L * 1024L,
+            seeders = 40,
+            peers = 4,
+            category = SearchCategory.Movies,
+        )
+        val verifiedOther = SearchUtils.makeResult(
+            providerId = "yts",
+            providerName = "YTS",
+            title = "Movie.2025.1080p.WEB-DL",
+            magnetUri = SearchUtils.buildMagnet(hashVerifiedOther, "VerifiedOther"),
+            sizeBytes = 2L * 1024L * 1024L * 1024L,
+            seeders = 25,
+            peers = 4,
+            category = SearchCategory.Movies,
+        )
+        val verifiedLatino = SearchUtils.makeResult(
+            providerId = "knaben",
+            providerName = "Knaben",
+            title = "Movie.2025.1080p.WEB-DL.Latino",
+            magnetUri = SearchUtils.buildMagnet(hashVerifiedLatino, "VerifiedLatino"),
+            sizeBytes = 2L * 1024L * 1024L * 1024L,
+            seeders = 20,
+            peers = 4,
+            category = SearchCategory.Movies,
+        )
+
+        val probes = mapOf(
+            hashVerifiedOther to SwarmProbeResult(
+                infoHash = hashVerifiedOther,
+                ttfmMs = 600L,
+                measuredDownloadBps = 2_500_000L,
+                activePeers = 10,
+                connectedSeeders = 8,
+            ),
+            hashVerifiedLatino to SwarmProbeResult(
+                infoHash = hashVerifiedLatino,
+                ttfmMs = 700L,
+                measuredDownloadBps = 2_000_000L,
+                activePeers = 8,
+                connectedSeeders = 6,
+            ),
+        )
+
+        val (sorted, _) = SearchService.evaluatePlayabilityAndSort(
+            results = listOf(untestedLatino, verifiedOther, verifiedLatino),
+            sortOrder = SearchSortOrder.BestPlayability,
+            languageFilter = SearchLanguageFilter.PrioritizeLatino,
+            probeResultsByHash = probes,
+        )
+
+        assertEquals(
+            listOf(verifiedLatino.id, verifiedOther.id, untestedLatino.id),
+            sorted.map { it.id },
+        )
     }
 }

@@ -64,4 +64,18 @@ class QuickStreamResolverTest {
         assertEquals(0, findMatchingEpisodeFileIndex(partial, season = 1, episode = 1))
         assertNull(findMatchingEpisodeFileIndex(partial, season = 1, episode = 2))
     }
+
+    @Test
+    fun autoPlaysMainMovieIgnoringSampleAndTinyExtraVideos() {
+        val files = listOf(
+            TorrentFile(0, "Movie.2024.1080p.mkv", "Movie/Movie.2024.1080p.mkv", 2_000_000_000L, 0.0, "video/x-matroska"),
+            TorrentFile(1, "Movie.2024.1080p.es.srt", "Movie/Movie.2024.1080p.es.srt", 50_000L, 0.0, "application/x-subrip"),
+            TorrentFile(2, "sample.mkv", "Movie/Sample/sample.mkv", 25_000_000L, 0.0, "video/x-matroska"),
+            TorrentFile(3, "clip.mp4", "Movie/clip.mp4", 10_000_000L, 0.0, "video/mp4"),
+            TorrentFile(4, "RARBG.com.mp4", "Movie/RARBG.com.mp4", 5_000_000L, 0.0, "video/mp4"),
+        )
+        val plan = resolveQuickStreamSelection(files, QuickStreamTarget("Movie"))
+        assertTrue(plan is QuickStreamPlan.AutoPlay)
+        assertEquals(setOf(0, 1), (plan as QuickStreamPlan.AutoPlay).selectedIndices)
+    }
 }

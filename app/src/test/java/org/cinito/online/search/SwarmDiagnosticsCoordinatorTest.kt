@@ -270,4 +270,96 @@ class SwarmDiagnosticsCoordinatorTest {
         probeJob.join()
         assertEquals(0, removedCount.get())
     }
+
+    @Test
+    fun forceRefreshBypassesCacheAndPolicyBlockIsNotCached() = runBlocking {
+        val addCalls = AtomicInteger(0)
+        var networkAllowed = false
+        var nowMs = 1_000L
+
+        val transport = EngineTransport { method, path, _ ->
+            when {
+                method == "POST" && path == "/add" -> {
+                    addCalls.incrementAndGet()
+                    EngineResponse(200, """{"id":"probe-refresh","infoHash":"$sampleHash"}""")
+                }
+                method == "GET" && path == "/torrent/probe-refresh" -> {
+                    val speed = if (addCalls.get() >= 2) 4_200_000L else 1_800_000L
+                    EngineResponse(
+                        200,
+                        """{"id":"probe-refresh","infoHash":"$sampleHash","ready":true,"done":false,"paused":false,"progress":0.05,"downloadSpeed":$speed,"uploadSpeed":0,"numPeers":12,"connectedSeeders":3,"length":1000000,"downloaded":65536,"uploaded":0,"files":[{"index":0,"name":"Movie.mp4","path":"Movie.mp4","length":1000000,"progress":0.05,"type":"video/mp4"}]}""",
+                    )
+                }
+                method == "POST" && path == "/focus" -> EngineResponse(200, """{"ok":true}""")
+                method == "POST" && path == "/remove" -> EngineResponse(200, """{"ok":true}""")
+                else -> error("Unexpected $method $path")
+            }
+        }
+
+        val coordinator = SwarmDiagnosticsCoordinator(
+            engineClient = EngineClient(transport),
+            clockMs = { nowMs },
+            delayFn = { dt -> nowMs += dt },
+            postReadySampleWindowMs = 0L,
+            canUseNetwork = { networkAllowed },
+        )
+
+        val blocked = coordinator.probeSingle(sampleResult())
+        assertNotNull(blocked)
+        assertTrue(blocked?.isPolicyBlocked == true)
+        assertEquals(0, addCalls.get())
+        assertEquals(null, coordinator.getCached(sampleHash))
+
+        networkAllowed = true
+        val firstReal = coordinator.probeSingle(sampleResult())
+        assertNotNull(firstReal)
+        assertFalse(firstReal?.isPolicyBlocked == true)
+        assertEquals(1_800_000L, firstReal?.measuredDownloadBps)
+        assertEquals(1, addCalls.get())
+
+        val cachedHit = coordinator.probeSingle(sampleResult())
+        assertEquals(1_800_000L, cachedHit?.measuredDownloadBps)
+        assertEquals(1, addCalls.get())
+
+        val refreshed = coordinator.probeSingle(sampleResult(), forceRefresh = true)
+        assertEquals(4_200_000L, refreshed?.measuredDownloadBps)
+        assertEquals(2, addCalls.get())
+    }
+
+    @Test
+    fun userClickWithPeersButZeroBytesFailsAndCleansUp() = runBlocking {
+        val removeCalls = AtomicInteger(0)
+        var nowMs = 1_000L
+        val transport = EngineTransport { method, path, body ->
+            when {
+                method == "POST" && path == "/add" -> EngineResponse(200, """{"id":"probe-choked","infoHash":"$sampleHash"}""")
+                method == "GET" && path == "/torrent/probe-choked" -> EngineResponse(
+                    200,
+                    """{"id":"probe-choked","infoHash":"$sampleHash","ready":true,"done":false,"paused":false,"progress":0.0,"downloadSpeed":0,"uploadSpeed":0,"numPeers":6,"connectedSeeders":0,"length":1500000000,"downloaded":0,"uploaded":0,"files":[{"index":0,"name":"Movie.1080p.mp4","path":"Movie.1080p.mp4","length":1500000000,"progress":0.0,"type":"video/mp4"}]}""",
+                )
+                method == "POST" && (path == "/configure" || path == "/play" || path == "/focus") -> EngineResponse(200, """{"ok":true}""")
+                method == "POST" && path == "/remove" -> {
+                    assertTrue(body?.contains("\"destroyStore\":true") == true)
+                    removeCalls.incrementAndGet()
+                    EngineResponse(200, """{"ok":true}""")
+                }
+                else -> error("Unexpected transport call: $method $path")
+            }
+        }
+        val coordinator = SwarmDiagnosticsCoordinator(
+            engineClient = EngineClient(transport),
+            clockMs = { nowMs },
+            delayFn = { dt -> nowMs += dt },
+            pollIntervalMs = 200L,
+        )
+
+        val probe = coordinator.probeSingle(sampleResult(), profile = ProbeProfile.USER_CLICK)
+        assertNotNull(probe)
+        assertEquals(0L, probe?.measuredDownloadBps)
+        assertEquals(6, probe?.activePeers)
+        assertEquals("Peers sin datos: 6 peers, 0 B recibidos", probe?.errorMessage)
+        assertTrue(probe?.isFailed == true)
+        assertFalse(probe?.isVerifiedLive == true)
+        assertEquals(1, removeCalls.get())
+    }
 }

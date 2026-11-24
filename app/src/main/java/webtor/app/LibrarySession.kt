@@ -62,6 +62,8 @@ class LibrarySession(
     private var lastPersistAt = 0L
     private var debounceJob: Job? = null
     private var prefetchJob: Job? = null
+    private var selectSyncJob: Job? = null
+    private var commitJob: Job? = null
     private var storageStatsJob: Job? = null
     private var eventJob: Job? = null
     private var lastServiceUpdate = 0L
@@ -296,12 +298,17 @@ class LibrarySession(
         }
     }
     fun closeAddSheet() {
-        if (commitInProgress) return
         draftGeneration++
         debounceJob?.cancel()
         prefetchJob?.cancel()
-        _ui.update {
-            it.copy(
+        selectSyncJob?.cancel()
+        commitJob?.cancel()
+        val draft = _ui.value.prepare
+        val id = if (draft != null && !draft.committed) draft.engineId else null
+        _ui.update { state ->
+            state.copy(
+                library = if (id != null) state.library.filterNot { it.engineId == id } else state.library,
+                prepare = if (id != null) null else state.prepare,
                 addSheetOpen = false,
                 prepareMode = PrepareMode.AddSheet,
                 quickStreamTarget = null,
@@ -309,7 +316,13 @@ class LibrarySession(
                 sourceStatus = null,
             )
         }
-        dropUncommittedPrefetch()
+        if (id != null) {
+            scope.launch(NonCancellable) {
+                if (_ui.value.library.none { it.engineId == id }) {
+                    runCatching { withContext(io) { client.remove(id, true) } }
+                }
+            }
+        }
     }
     fun consumePendingDetails() {
         _ui.update { it.copy(pendingDetailsKey = null) }
@@ -795,7 +808,24 @@ class LibrarySession(
                 )
             }
             if (prep.torrent?.ready != true && prefetchJob?.isActive != true) {
-                prefetchJob = scope.launch { runCatching { waitReady(prep.engineId) } }
+                val generation = draftGeneration
+                prefetchJob = scope.launch {
+                    try {
+                        waitReady(prep.engineId)
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        if (generation != draftGeneration || isShuttingDown.get()) return@launch
+                        val msg = readableError(t)
+                        _ui.update { state ->
+                            val currentPrep = state.prepare
+                            if (currentPrep != null && currentPrep.engineId == prep.engineId) {
+                                state.copy(prepare = currentPrep.copy(error = msg, busy = false), error = msg)
+                            } else {
+                                state.copy(error = msg)
+                            }
+                        }
+                    }
+                }
             }
             return
         }
@@ -834,8 +864,14 @@ class LibrarySession(
         displayTitle: String? = null,
         season: Int? = null,
         episode: Int? = null,
+        reportedSeeders: Int? = null,
+        reportedPeers: Int? = null,
     ) {
-        if (commitInProgress || !beginUserWork()) return
+        if (commitInProgress || !beginUserWork()) {
+            Log.w(EngineHost.TAG, "startQuickStream ignored: commitInProgress=$commitInProgress")
+            return
+        }
+        Log.i(EngineHost.TAG, "startQuickStream title=${displayTitle?.take(32)}")
         val id = torrentId.trim()
         if (id.isEmpty()) {
             _ui.update { it.copy(error = "El enlace del torrent está vacío.") }
@@ -852,6 +888,8 @@ class LibrarySession(
                     displayTitle = displayTitle?.takeIf(String::isNotBlank) ?: id.take(48),
                     season = season,
                     episode = episode,
+                    reportedSeeders = reportedSeeders,
+                    reportedPeers = reportedPeers,
                 ),
                 magnetDraft = id,
                 error = null,
@@ -868,8 +906,14 @@ class LibrarySession(
     fun openFileChooserForMagnet(
         torrentId: String,
         displayTitle: String? = null,
+        reportedSeeders: Int? = null,
+        reportedPeers: Int? = null,
     ) {
-        if (commitInProgress || !beginUserWork()) return
+        if (commitInProgress || !beginUserWork()) {
+            Log.w(EngineHost.TAG, "openFileChooserForMagnet ignored: commitInProgress=$commitInProgress")
+            return
+        }
+        Log.i(EngineHost.TAG, "openFileChooserForMagnet title=${displayTitle?.take(32)}")
         val id = torrentId.trim()
         if (id.isEmpty()) {
             _ui.update { it.copy(error = "El enlace del torrent está vacío.") }
@@ -882,7 +926,13 @@ class LibrarySession(
             it.copy(
                 addSheetOpen = false,
                 prepareMode = PrepareMode.ChooseFiles,
-                quickStreamTarget = displayTitle?.takeIf(String::isNotBlank)?.let { QuickStreamTarget(it) },
+                quickStreamTarget = displayTitle?.takeIf(String::isNotBlank)?.let { title ->
+                    QuickStreamTarget(
+                        displayTitle = title,
+                        reportedSeeders = reportedSeeders,
+                        reportedPeers = reportedPeers,
+                    )
+                },
                 magnetDraft = id,
                 error = null,
                 sourceStatus = null,
@@ -895,8 +945,13 @@ class LibrarySession(
         val current = _ui.value
         if (current.prepareMode != PrepareMode.QuickStream) return
         val hasError = !current.error.isNullOrBlank() || !current.prepare?.error.isNullOrBlank()
-        _ui.update {
-            it.copy(
+        _ui.update { state ->
+            val draft = state.prepare
+            val files = draft?.torrent?.files.orEmpty()
+            val videos = files.filter { it.name.isVideoName() || it.path.isVideoName() }
+            val nextPrepare = if (draft != null && videos.size > 1) draft.copy(selected = emptySet()) else draft
+            state.copy(
+                prepare = nextPrepare,
                 prepareMode = PrepareMode.ChooseFiles,
                 addSheetOpen = false,
             )
@@ -912,17 +967,18 @@ class LibrarySession(
         if (id.isEmpty() || commitInProgress || !beginUserWork()) return
         debounceJob?.cancel()
         prefetchJob?.cancel()
+        selectSyncJob?.cancel()
         draftGeneration++
         val oldId = current.prepare?.engineId
         _ui.update { it.copy(prepare = null, error = null, sourceStatus = null) }
-        prefetchJob = scope.launch {
-            if (oldId != null) {
-                mutex.withLock {
-                    if (_ui.value.library.none { it.engineId == oldId }) {
-                        runCatching { withContext(io) { client.remove(oldId, true) } }
-                    }
+        if (oldId != null) {
+            scope.launch(NonCancellable) {
+                if (_ui.value.library.none { it.engineId == oldId }) {
+                    runCatching { withContext(io) { client.remove(oldId, true) } }
                 }
             }
+        }
+        prefetchJob = scope.launch {
             addTorrent(id, commit = false)
         }
     }
@@ -932,8 +988,18 @@ class LibrarySession(
         if (commitInProgress || !beginUserWork()) return
         debounceJob?.cancel()
         prefetchJob?.cancel()
+        selectSyncJob?.cancel()
         val generation = ++draftGeneration
-        _ui.update { it.copy(addSheetOpen = true, magnetDraft = "", error = null, sourceStatus = "Reading torrent file…") }
+        _ui.update {
+            it.copy(
+                addSheetOpen = true,
+                prepareMode = PrepareMode.AddSheet,
+                quickStreamTarget = null,
+                magnetDraft = "",
+                error = null,
+                sourceStatus = "Reading torrent file…",
+            )
+        }
         prefetchJob = scope.launch {
             try {
                 val (name, bytes) = withContext(io) {
@@ -964,15 +1030,30 @@ class LibrarySession(
     }
 
     fun cancelPrepare() {
-        if (commitInProgress) return
         draftGeneration++
+        commitInProgress = false
         debounceJob?.cancel()
         prefetchJob?.cancel()
+        selectSyncJob?.cancel()
+        commitJob?.cancel()
+        commitJob = null
         val id = _ui.value.prepare?.engineId
-        _ui.update { it.copy(prepare = null, screen = Screen.Library, error = null) }
-        scope.launch {
-            mutex.withLock {
-                if (id != null && _ui.value.library.none { it.engineId == id }) {
+        Log.i(EngineHost.TAG, "cancelPrepare id=$id gen=$draftGeneration")
+        _ui.update { state ->
+            state.copy(
+                library = if (id != null) state.library.filterNot { it.engineId == id } else state.library,
+                prepare = null,
+                prepareMode = PrepareMode.AddSheet,
+                quickStreamTarget = null,
+                screen = Screen.Library,
+                addSheetOpen = false,
+                sourceStatus = null,
+                error = null,
+            )
+        }
+        if (id != null) {
+            scope.launch(NonCancellable) {
+                if (_ui.value.library.none { it.engineId == id }) {
                     runCatching { withContext(io) { client.remove(id, true) } }
                 }
             }
@@ -980,17 +1061,7 @@ class LibrarySession(
     }
 
     fun cancelQuickPrepare() {
-        if (commitInProgress) return
-        _ui.update {
-            it.copy(
-                addSheetOpen = false,
-                prepareMode = PrepareMode.AddSheet,
-                quickStreamTarget = null,
-                magnetDraft = "",
-                sourceStatus = null,
-                error = null,
-            )
-        }
+        _ui.update { it.copy(magnetDraft = "") }
         cancelPrepare()
     }
 
@@ -1103,6 +1174,19 @@ class LibrarySession(
     fun startDownload() = commitPreparedDownload()
     fun startDirectPlay() = commitPreparedDownload(directPlay = true)
 
+    fun playPreparedFile(fileIndex: Int) {
+        val draft = _ui.value.prepare ?: return
+        val files = draft.torrent?.files ?: return
+        val chosen = files.find { it.index == fileIndex } ?: return
+        val selected = selectVideoWithMatchingSubtitles(files, chosen)
+        _ui.update { state ->
+            val current = state.prepare ?: return@update state
+            if (current.engineId != draft.engineId) state
+            else state.copy(prepare = current.copy(selected = selected, error = null))
+        }
+        commitPreparedDownload(directPlay = true)
+    }
+
     private suspend fun releasePreparedEngine(id: String) {
         if (_ui.value.library.any { it.engineId == id }) return
         withContext(io + NonCancellable) {
@@ -1115,168 +1199,221 @@ class LibrarySession(
     }
 
     private fun commitPreparedDownload(directPlay: Boolean = false) {
-        scope.launch {
-            mutex.withLock {
-                if (commitInProgress || !beginUserWork()) return@withLock
-                val draft = _ui.value.prepare ?: return@withLock
-                val torrent = draft.torrent
-                if (torrent?.ready != true) {
-                    if (directPlay) { setPrepareError("Waiting for file information. You can save the magnet as a download meanwhile."); return@withLock }
-                    val source = draft.source.trim()
-                    if (!isMagnetLink(source)) {
-                        setPrepareError("Still reading this torrent. Try again in a moment.")
+        if (commitInProgress || !beginUserWork()) return
+        val commitGen = draftGeneration
+        commitJob = scope.launch {
+            val myJob = coroutineContext[Job]
+            var committedDirectPlayEntry: DownloadEntry? = null
+            var committedKey: String? = null
+            try {
+                mutex.withLock {
+                    if (commitGen != draftGeneration || !beginUserWork()) return@withLock
+                    val draft = _ui.value.prepare ?: return@withLock
+                    val torrent = draft.torrent
+                    if (torrent?.ready != true) {
+                        if (directPlay) { setPrepareError("Waiting for file information. You can save the magnet as a download meanwhile."); return@withLock }
+                        val source = draft.source.trim()
+                        if (!isMagnetLink(source)) {
+                            setPrepareError("Still reading this torrent. Try again in a moment.")
+                            return@withLock
+                        }
+                        val key = infoHashFromMagnet(source) ?: draft.engineId
+                        if (_ui.value.library.any { it.key.equals(key, true) || it.engineId == draft.engineId }) {
+                            setPrepareError("This torrent is already in your library.")
+                            return@withLock
+                        }
+                        val pending = DownloadEntry(
+                            key = key,
+                            generation = withContext(io) { storage.nextGeneration(key) },
+                            // The name in a magnet is URL-encoded ("Big+Buck+Bunny").
+                            title = source.substringAfter("dn=", "").substringBefore('&')
+                                .let { name -> runCatching { java.net.URLDecoder.decode(name, "UTF-8") }.getOrDefault(name) }
+                                .trim().ifBlank { key.take(12) },
+                            source = source,
+                            metadata = "",
+                            engineId = draft.engineId,
+                            destination = "Downloads/Webtor",
+                            files = emptyList(),
+                            selected = emptySet(),
+                            paused = false,
+                            status = torrent,
+                            lifecycleState = EntryLifecycleState.DOWNLOADING,
+                            metadataReady = false,
+                            autoSelect = true,
+                        )
+                        _ui.update {
+                            it.copy(
+                                library = listOf(pending) + it.library,
+                                prepare = null,
+                                addSheetOpen = false,
+                                prepareMode = PrepareMode.AddSheet,
+                                quickStreamTarget = null,
+                                screen = Screen.Library,
+                                magnetDraft = "",
+                                message = "Descarga iniciada en Biblioteca",
+                            )
+                        }
+                        // The draft prefetch may be in waitReady; it must not own or
+                        // remove this now committed engine record.
+                        prefetchJob?.cancel()
+                        persist()
+                        syncService(force = true)
+                        reconcileTransferState()
                         return@withLock
                     }
-                    val key = infoHashFromMagnet(source) ?: draft.engineId
-                    if (_ui.value.library.any { it.key.equals(key, true) || it.engineId == draft.engineId }) {
+                    if (draft.selected.isEmpty()) {
+                        setPrepareError("Select at least one file to download.")
+                        return@withLock
+                    }
+                    if (_ui.value.library.any { it.key.equals(torrent.infoHash, true) || it.engineId == draft.engineId }) {
                         setPrepareError("This torrent is already in your library.")
                         return@withLock
                     }
-                    val pending = DownloadEntry(
+                    if (!directPlay && Build.VERSION.SDK_INT < 29) {
+                        setPrepareError("Torrent Player needs Android 10 or newer to save into Downloads.")
+                        return@withLock
+                    }
+                    commitInProgress = true
+                    val key = torrent.infoHash ?: draft.engineId
+                    committedKey = key
+                    val provisional = DownloadEntry(
+                        directPlay = directPlay,
                         key = key,
                         generation = withContext(io) { storage.nextGeneration(key) },
-                        // The name in a magnet is URL-encoded ("Big+Buck+Bunny").
-                        title = source.substringAfter("dn=", "").substringBefore('&')
-                            .let { name -> runCatching { java.net.URLDecoder.decode(name, "UTF-8") }.getOrDefault(name) }
-                            .trim().ifBlank { key.take(12) },
-                        source = source,
+                        title = torrent.name ?: key,
+                        source = torrent.magnetURI ?: draft.source,
                         metadata = "",
                         engineId = draft.engineId,
-                        destination = "Downloads/Webtor",
-                        files = emptyList(),
-                        selected = emptySet(),
+                        destination = if (directPlay) "Direct Play · RAM + startup cache" else "Downloads/Webtor",
+                        files = torrent.files.map {
+                            SavedFile(
+                                it.index, it.name, it.path, it.length,
+                                progress = it.progress,
+                                verifiedBytes = it.verifiedBytes.coerceIn(0L, it.length.coerceAtLeast(0L)),
+                            )
+                        },
+                        selected = draft.selected,
                         paused = false,
                         status = torrent,
-                        lifecycleState = EntryLifecycleState.DOWNLOADING,
-                        metadataReady = false,
-                        autoSelect = true,
+                        lifecycleState = EntryLifecycleState.PREPARING,
+                        metadataReady = true,
                     )
+                    // Render the accepted download before any storage or engine I/O. The
+                    // provisional entry is not persisted until configuration succeeds.
                     _ui.update {
                         it.copy(
-                            library = listOf(pending) + it.library,
-                            prepare = null,
-                            addSheetOpen = false,
-                            prepareMode = PrepareMode.AddSheet,
-                            quickStreamTarget = null,
-                            screen = Screen.Library,
-                            magnetDraft = "",
-                            message = "Descarga iniciada en Biblioteca",
+                            library = listOf(provisional) + it.library,
+                            prepare = draft.copy(busy = true, error = null),
+                            sourceStatus = if (directPlay) "Iniciando reproducción…" else it.sourceStatus,
                         )
                     }
-                    // The draft prefetch may be in waitReady; it must not own or
-                    // remove this now committed engine record.
-                    prefetchJob?.cancel()
-                    persist()
-                    syncService(force = true)
-                    reconcileTransferState()
-                    return@withLock
-                }
-                if (draft.selected.isEmpty()) {
-                    setPrepareError("Select at least one file to download.")
-                    return@withLock
-                }
-                if (_ui.value.library.any { it.key.equals(torrent.infoHash, true) || it.engineId == draft.engineId }) {
-                    setPrepareError("This torrent is already in your library.")
-                    return@withLock
-                }
-                if (!directPlay && Build.VERSION.SDK_INT < 29) {
-                    setPrepareError("Torrent Player needs Android 10 or newer to save into Downloads.")
-                    return@withLock
-                }
-                commitInProgress = true
-                val key = torrent.infoHash ?: draft.engineId
-                val provisional = DownloadEntry(
-                    directPlay = directPlay,
-                    key = key,
-                    generation = withContext(io) { storage.nextGeneration(key) },
-                    title = torrent.name ?: key,
-                    source = torrent.magnetURI ?: draft.source,
-                    metadata = "",
-                    engineId = draft.engineId,
-                    destination = if (directPlay) "Direct Play · RAM + startup cache" else "Downloads/Webtor",
-                    files = torrent.files.map {
-                        SavedFile(
-                            it.index, it.name, it.path, it.length,
-                            progress = it.progress,
-                            verifiedBytes = it.verifiedBytes.coerceIn(0L, it.length.coerceAtLeast(0L)),
-                        )
-                    },
-                    selected = draft.selected,
-                    paused = false,
-                    status = torrent,
-                    lifecycleState = EntryLifecycleState.PREPARING,
-                    metadataReady = true,
-                )
-                // Render the accepted download before any storage or engine I/O. The
-                // provisional entry is not persisted until configuration succeeds.
-                _ui.update {
-                    it.copy(
-                        library = listOf(provisional) + it.library,
-                        prepare = draft.copy(busy = true, error = null),
-                        addSheetOpen = false,
-                        screen = Screen.Library,
-                    )
-                }
-                _events.trySend(UiEvent.RequestNotifications)
-                try {
-                    val needed = torrent.files.filter { it.index in draft.selected }.sumOf { it.length }
-                    val free = withContext(io) { storage.freeBytes }
-                    check(directPlay || needed <= free) {
-                        "Not enough storage. This download needs ${formatBytes(needed)}; ${formatBytes(free)} is available."
-                    }
-
-                    val metadata = withContext(io) { client.metadata(draft.engineId) }
-                    val skeleton = provisional.copy(metadata = metadata)
-                    val createdResult = if (directPlay) CreatedDownloadFiles(skeleton.files) else withContext(io) { storage.createFiles(skeleton, storage.folder) }
-                    val created = createdResult.files
+                    _events.trySend(UiEvent.RequestNotifications)
                     try {
-                        val pfds = if (directPlay) emptyList() else withContext(io) { storage.openFiles(created, draft.selected) }
-                        try {
-                            val descriptors = if (directPlay) List<Int?>(created.size) { null } else descriptorsFor(created, pfds, draft.selected)
-                            refreshAutoRamCache()
-                            withContext(io) { client.configure(draft.engineId, descriptors, draft.selected, if (directPlay) "stream" else "download", directPlayMemoryBytes()) }
-                        } finally {
-                            pfds.forEach { runCatching { it?.close() } }
+                        val needed = torrent.files.filter { it.index in draft.selected }.sumOf { it.length }
+                        val free = withContext(io) { storage.freeBytes }
+                        check(directPlay || needed <= free) {
+                            "Not enough storage. This download needs ${formatBytes(needed)}; ${formatBytes(free)} is available."
                         }
+
+                        val metadata = withContext(io) { client.metadata(draft.engineId) }
+                        val skeleton = provisional.copy(metadata = metadata)
+                        val createdResult = if (directPlay) CreatedDownloadFiles(skeleton.files) else withContext(io) { storage.createFiles(skeleton, storage.folder) }
+                        val created = createdResult.files
+                        try {
+                            val pfds = if (directPlay) emptyList() else withContext(io) { storage.openFiles(created, draft.selected) }
+                            try {
+                                val descriptors = if (directPlay) List<Int?>(created.size) { null } else descriptorsFor(created, pfds, draft.selected)
+                                refreshAutoRamCache()
+                                withContext(io) { client.configure(draft.engineId, descriptors, draft.selected, if (directPlay) "stream" else "download", directPlayMemoryBytes()) }
+                            } finally {
+                                pfds.forEach { runCatching { it?.close() } }
+                            }
+                        } catch (t: Throwable) {
+                            runCatching { withContext(io + NonCancellable) { storage.deleteFiles(created) } }
+                            throw t
+                        }
+                        val entry = skeleton.copy(
+                            files = created,
+                            downloadGroupUri = createdResult.groupUri,
+                            lifecycleState = EntryLifecycleState.DOWNLOADING,
+                        )
+                        serviceSuppressed = false
+                        settings.edit().putBoolean("serviceSuppressed", false).apply()
+                        if (directPlay) {
+                            committedDirectPlayEntry = entry
+                            _ui.update {
+                                it.copy(
+                                    library = listOf(entry) + it.library.filter { e -> e.key != key },
+                                    screen = Screen.Library,
+                                    addSheetOpen = false,
+                                    magnetDraft = "",
+                                    sourceStatus = "Iniciando reproducción…",
+                                )
+                            }
+                        } else {
+                            _ui.update {
+                                it.copy(
+                                    library = listOf(entry) + it.library.filter { e -> e.key != key },
+                                    prepare = null,
+                                    screen = Screen.Library,
+                                    addSheetOpen = false,
+                                    prepareMode = PrepareMode.AddSheet,
+                                    quickStreamTarget = null,
+                                    magnetDraft = "",
+                                    sourceStatus = null,
+                                    message = "Descarga iniciada en Biblioteca",
+                                )
+                            }
+                        }
+                        persist()
+                        refreshStorageStats()
+                        syncService(force = true)
+                        reconcileTransferState()
                     } catch (t: Throwable) {
-                        runCatching { withContext(io) { storage.deleteFiles(created) } }
-                        throw t
+                        if (t is CancellationException) {
+                            _ui.update { state ->
+                                state.copy(library = state.library.filterNot { entry -> entry.key == key })
+                            }
+                            throw t
+                        }
+                        _ui.update {
+                            it.copy(
+                                library = it.library.filterNot { entry -> entry.key == key },
+                                addSheetOpen = it.prepareMode == PrepareMode.AddSheet,
+                                prepare = draft.copy(busy = false, error = readableError(t)),
+                                sourceStatus = null,
+                            )
+                        }
                     }
-                    val entry = skeleton.copy(
-                        files = created,
-                        downloadGroupUri = createdResult.groupUri,
-                        lifecycleState = EntryLifecycleState.DOWNLOADING,
-                    )
-                    serviceSuppressed = false
-                    settings.edit().putBoolean("serviceSuppressed", false).apply()
-                    _ui.update {
-                        it.copy(
-                            library = listOf(entry) + it.library.filter { e -> e.key != key },
-                            prepare = null,
-                            screen = Screen.Library,
-                            addSheetOpen = false,
-                            prepareMode = PrepareMode.AddSheet,
-                            quickStreamTarget = null,
-                            magnetDraft = "",
-                            message = if (directPlay) it.message else "Descarga iniciada en Biblioteca",
-                        )
+                }
+                val entryToPlay = committedDirectPlayEntry
+                if (entryToPlay != null && commitGen == draftGeneration) {
+                    val content = runPreparePlay(entryToPlay, fileIndex = null, fromStart = false)
+                    if (commitGen == draftGeneration) {
+                        _ui.update {
+                            it.copy(
+                                prepare = null,
+                                prepareMode = PrepareMode.AddSheet,
+                                quickStreamTarget = null,
+                                sourceStatus = null,
+                            )
+                        }
+                        if (content != null) _events.send(content)
                     }
-                    persist()
-                    refreshStorageStats()
-                    syncService(force = true)
-                    reconcileTransferState()
-                    if (directPlay) play(entry)
-                } catch (t: Throwable) {
-                    _ui.update {
-                        it.copy(
-                            library = it.library.filterNot { entry -> entry.key == key },
-                            addSheetOpen = it.prepareMode == PrepareMode.AddSheet,
-                            prepare = draft.copy(busy = false, error = readableError(t)),
-                        )
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) {
+                    val k = committedKey
+                    if (k != null) {
+                        _ui.update { state ->
+                            state.copy(library = state.library.filterNot { entry -> entry.key == k })
+                        }
                     }
-                    if (t is CancellationException) throw t
-                } finally {
-                    commitInProgress = false
+                    throw t
+                }
+            } finally {
+                withContext(NonCancellable) {
+                    if (commitJob == myJob) commitInProgress = false
                 }
             }
         }
@@ -1733,8 +1870,8 @@ class LibrarySession(
             // The engine refuses unfinished files while torrent data is paused.
             playbackDataBlock(_ui.value.batteryPaused, _ui.value.networkAllowed, _ui.value.networkReason)?.let { error(it) }
             val status = withContext(io) { client.torrent(id) }
+            applyStatus(status, current.key, current.generation)
             if (status.checking) {
-                applyStatus(status, current.key, current.generation)
                 persist()
                 syncService()
                 _ui.update { it.copy(message = "Checking saved data. Play will be available when the check finishes.") }
@@ -1778,7 +1915,15 @@ class LibrarySession(
     }
 
     fun showFiles(entry: DownloadEntry) {
-        _ui.update { it.copy(screen = Screen.Files, openTorrentKey = entry.key, error = null) }
+        _ui.update {
+            it.copy(
+                screen = Screen.Files,
+                openTorrentKey = entry.key,
+                prepareMode = PrepareMode.AddSheet,
+                quickStreamTarget = null,
+                error = null,
+            )
+        }
         warmDirectPlay(entry.key)
     }
 
@@ -2226,6 +2371,8 @@ class LibrarySession(
 
         debounceJob?.cancel()
         prefetchJob?.cancel()
+        selectSyncJob?.cancel()
+        commitJob?.cancel()
         storageStatsJob?.cancel()
         eventJob?.cancel()
 
@@ -2451,6 +2598,19 @@ class LibrarySession(
         }
         var createdId: String? = null
         try {
+            if (!_ui.value.engineReady) waitForEngine()
+            if (isShuttingDown.get() || generation != draftGeneration) return
+            if (!_ui.value.engineReady) {
+                _ui.update {
+                    it.copy(
+                        error = "El motor de descargas no está activo. Cierra CiniTo y ábrelo de nuevo.",
+                        addSheetOpen = if (commit) false else it.addSheetOpen,
+                    )
+                }
+                return
+            }
+            val hash = resolveLibraryHash(torrentId)
+            if (isShuttingDown.get() || generation != draftGeneration) return
             val addedId = mutex.withLock {
                 if (isShuttingDown.get() || generation != draftGeneration) return
                 val prev = _ui.value.prepare
@@ -2471,7 +2631,6 @@ class LibrarySession(
                     runCatching { withContext(io) { client.remove(prev.engineId, true) } }
                     _ui.update { it.copy(prepare = null) }
                 }
-                val hash = resolveLibraryHash(torrentId)
                 val existingByHash = hash?.let { h -> _ui.value.library.find { it.key.equals(h, true) } }
                 if (existingByHash != null) {
                     handleExistingInPrepare(existingByHash, torrentId)
@@ -2487,16 +2646,6 @@ class LibrarySession(
                     }
                     return
                 }
-                if (!_ui.value.engineReady) waitForEngine()
-                if (!_ui.value.engineReady) {
-                    _ui.update {
-                        it.copy(
-                            error = "El motor de descargas no está activo. Cierra CiniTo y ábrelo de nuevo.",
-                            addSheetOpen = if (commit) false else it.addSheetOpen,
-                        )
-                    }
-                    return
-                }
                 // Capture the returned ID even when cancellation arrives during blocking HTTP.
                 val added = withContext(io + NonCancellable) {
                     if (torrentBytes != null) {
@@ -2505,6 +2654,7 @@ class LibrarySession(
                         client.add(torrentId, prepare = true)
                     }.also { createdId = it.id }
                 }
+                Log.i(EngineHost.TAG, "addTorrent added id=${added.id} hash=${added.infoHash} net=${_ui.value.networkAllowed}")
                 if (generation != draftGeneration || isShuttingDown.get()) throw CancellationException("Draft replaced")
                 val existing = _ui.value.library.find { it.engineId == added.id || it.key.equals(added.infoHash, true) }
                 if (existing != null) {
@@ -2542,8 +2692,13 @@ class LibrarySession(
                     }
                     QuickStreamPlan.NeedsFileSelection -> {
                         _ui.update { state ->
-                            if (state.prepare?.engineId == addedId && state.prepareMode == PrepareMode.QuickStream) {
-                                state.copy(prepareMode = PrepareMode.ChooseFiles, error = null)
+                            val draft = state.prepare
+                            if (draft?.engineId == addedId && state.prepareMode == PrepareMode.QuickStream) {
+                                state.copy(
+                                    prepare = draft.copy(selected = emptySet()),
+                                    prepareMode = PrepareMode.ChooseFiles,
+                                    error = null,
+                                )
                             } else state
                         }
                     }
@@ -2561,8 +2716,8 @@ class LibrarySession(
             if (generation != draftGeneration || isShuttingDown.get()) return
             val msg = readableError(t)
             _ui.update { state ->
-                if (state.prepare != null && (state.screen == Screen.Prepare || state.prepare.committed)) {
-                    state.copy(prepare = state.prepare.copy(error = msg, busy = false))
+                if (state.prepare != null && (state.screen == Screen.Prepare || state.prepare.committed || state.prepareMode != PrepareMode.AddSheet)) {
+                    state.copy(prepare = state.prepare.copy(error = msg, busy = false), error = msg)
                 } else {
                     state.copy(error = msg)
                 }
@@ -2584,6 +2739,7 @@ class LibrarySession(
         val start = android.os.SystemClock.elapsedRealtime()
         var last: TorrentStatus? = null
         var version = -1L
+        var zeroPeersSinceMs: Long? = null
         while (android.os.SystemClock.elapsedRealtime() - start < timeoutMs) {
             if (forPrepare && _ui.value.prepare?.engineId != id) throw CancellationException("prefetch cleared")
             val t = withContext(io) { client.torrent(id) }
@@ -2597,9 +2753,23 @@ class LibrarySession(
                 }
                 return t
             }
-            val remaining = timeoutMs - (android.os.SystemClock.elapsedRealtime() - start)
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (t.numPeers == 0) {
+                val since = zeroPeersSinceMs ?: now.also { zeroPeersSinceMs = it }
+                if (forPrepare && now - since >= 22_000L) {
+                    error("Sin fuentes disponibles tras 22s. Prueba otro resultado.")
+                }
+            } else {
+                zeroPeersSinceMs = null
+            }
+            val remaining = timeoutMs - (now - start)
             if (remaining <= 0) break
-            version = engineHost.awaitChange(version, remaining)
+            val waitMs = if (forPrepare && zeroPeersSinceMs != null) {
+                minOf(remaining, (22_000L - (now - zeroPeersSinceMs!!)).coerceAtLeast(1L))
+            } else {
+                remaining
+            }
+            version = engineHost.awaitChange(version, waitMs)
         }
         val peers = last?.numPeers ?: 0
         error(
@@ -2612,7 +2782,15 @@ class LibrarySession(
         val draft = _ui.value.prepare ?: return
         if (draft.committed) return
         if (exceptSource != null && draft.source == exceptSource) return
-        cancelPrepare()
+        prefetchJob?.cancel()
+        selectSyncJob?.cancel()
+        val id = draft.engineId
+        _ui.update { it.copy(prepare = null) }
+        scope.launch(NonCancellable) {
+            if (_ui.value.library.none { it.engineId == id }) {
+                runCatching { withContext(io) { client.remove(id, true) } }
+            }
+        }
     }
 
     private fun syncPrepareSelection() {
@@ -2620,8 +2798,10 @@ class LibrarySession(
         if (draft.torrent?.ready != true) return
         val id = draft.engineId
         val selected = draft.selected
-        scope.launch {
+        selectSyncJob?.cancel()
+        selectSyncJob = scope.launch {
             runCatching { withContext(io) { client.select(id, selected) } }
+                .onFailure { if (it is CancellationException) throw it }
         }
     }
 
@@ -2631,7 +2811,12 @@ class LibrarySession(
             if (draft.engineId != t.id) return@update state
             val selected = when {
                 draft.torrent?.ready == true -> draft.selected
-                t.files.isNotEmpty() -> defaultVideoSelection(t.files)
+                state.prepareMode == PrepareMode.QuickStream -> emptySet()
+                t.files.isNotEmpty() -> {
+                    val videos = t.files.filter { it.name.isVideoName() || it.path.isVideoName() }
+                    if (state.prepareMode == PrepareMode.ChooseFiles && videos.size > 1) emptySet()
+                    else defaultVideoSelection(t.files)
+                }
                 else -> emptySet()
             }
             state.copy(prepare = draft.copy(torrent = t, selected = selected))
@@ -2987,10 +3172,11 @@ class LibrarySession(
         var eventVersion = -1L
         while (true) {
             if (isShuttingDown.get()) break
+            val hasLiveWork = _ui.value.prepare != null || _ui.value.library.any { it.hasActiveTransfer() }
             val nextVersion = try {
                 // Bound recovery reads for newly attached/missing status and
                 // metadata-pending records; ordinary idle rows stay event-driven.
-                withContext(io) { engineHost.awaitChange(eventVersion, 5_000) }
+                withContext(io) { engineHost.awaitChange(eventVersion, if (hasLiveWork) 1_000L else 5_000L) }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
                 delay(500)
@@ -3005,13 +3191,13 @@ class LibrarySession(
 
             val targets = state.library.mapNotNull { e ->
                 val id = e.engineId ?: return@mapNotNull null
-                if (!engineChanged && !needsDiscoveryStatusRefresh(e)) return@mapNotNull null
+                if (!engineChanged && !needsDiscoveryStatusRefresh(e) && !e.hasActiveTransfer()) return@mapNotNull null
                 if (e.isDeleting || e.lifecycleState == EntryLifecycleState.PREPARING || e.lifecycleState == EntryLifecycleState.DELETING || e.lifecycleState == EntryLifecycleState.STOPPING || e.lifecycleState == EntryLifecycleState.PAUSING) {
                     return@mapNotNull null
                 }
                 StatusTarget(e.key, id, e.generation)
             }
-            val prepareTarget = if (engineChanged && prefetchJob?.isActive != true) state.prepare?.engineId else null
+            val prepareTarget = if (prefetchJob?.isActive != true) state.prepare?.engineId else null
 
             var changed = false
             var completed = false
@@ -3322,6 +3508,19 @@ class LibrarySession(
         val needed = minOf(2L * 1024 * 1024, length.coerceAtLeast(0L))
         while (android.os.SystemClock.elapsedRealtime() < deadline) {
             val snapshot = withContext(io) { client.torrent(id) }
+            _ui.value.library.find { it.engineId == id }?.let { entry ->
+                applyStatus(snapshot, entry.key, entry.generation)
+            }
+            if (_ui.value.prepare?.engineId == id) {
+                _ui.update { state ->
+                    val draft = state.prepare
+                    if (draft != null && draft.engineId == id) {
+                        state.copy(prepare = draft.copy(torrent = snapshot))
+                    } else {
+                        state
+                    }
+                }
+            }
             val target = snapshot.files.find { it.index == fileIndex }
             if (target != null && (target.verifiedBytes >= needed || target.progress >= 1.0)) return
             val remaining = deadline - android.os.SystemClock.elapsedRealtime()

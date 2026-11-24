@@ -80,16 +80,19 @@ impl HttpClient {
             opt.user_agent.as_str()
         };
 
+        let host = url.host_str().map(str::to_string);
         if self.dialer.is_some() {
             let (status, body) = self
                 .exchange_dialed(&url, ua, opt.host_header.as_str())
                 .await?;
             if status != 200 {
+                log_non_200("announce", host.as_deref(), status, &body);
                 return Err(TrackerError::HttpStatus {
                     status,
                     body: String::from_utf8_lossy(&body).into_owned(),
                 });
             }
+            log::debug!(target: "webtor-engine", "http announce ok host={} body_len={}", host.as_deref().unwrap_or("?"), body.len());
             return parse_announce_body(&body);
         }
 
@@ -113,13 +116,15 @@ impl HttpClient {
         let body = resp
             .bytes()
             .await
-            .map_err(|e| TrackerError::Other(e.to_string()))?;
+            .map_err(|e| TrackerError::Other(error_chain(&e)))?;
         if status != 200 {
+            log_non_200("announce", host.as_deref(), status, &body);
             return Err(TrackerError::HttpStatus {
                 status,
                 body: String::from_utf8_lossy(&body).into_owned(),
             });
         }
+        log::debug!(target: "webtor-engine", "http announce ok host={} body_len={}", host.as_deref().unwrap_or("?"), body.len());
         parse_announce_body(&body)
     }
 
@@ -151,11 +156,13 @@ impl HttpClient {
             url.set_query(Some(&q));
         }
 
+        let host = url.host_str().map(str::to_string);
         if self.dialer.is_some() {
             let (status, body) = self
                 .exchange_dialed(&url, DEFAULT_HTTP_USER_AGENT, "")
                 .await?;
             if status != 200 {
+                log_non_200("scrape", host.as_deref(), status, &body);
                 return Err(TrackerError::HttpStatus {
                     status,
                     body: String::from_utf8_lossy(&body).into_owned(),
@@ -177,8 +184,9 @@ impl HttpClient {
         let body = resp
             .bytes()
             .await
-            .map_err(|e| TrackerError::Other(e.to_string()))?;
+            .map_err(|e| TrackerError::Other(error_chain(&e)))?;
         if status != 200 {
+            log_non_200("scrape", host.as_deref(), status, &body);
             return Err(TrackerError::HttpStatus {
                 status,
                 body: String::from_utf8_lossy(&body).into_owned(),
@@ -209,10 +217,21 @@ impl HttpClient {
             format!("{host}:{port}")
         };
 
-        let tcp = tokio::time::timeout(self.timeout, dialer("tcp".into(), addr))
-            .await
-            .map_err(|_| TrackerError::Timeout)?
-            .map_err(TrackerError::Io)?;
+        let dial_started = std::time::Instant::now();
+        let tcp = match tokio::time::timeout(self.timeout, dialer("tcp".into(), addr.clone())).await {
+            Ok(Ok(tcp)) => {
+                log::debug!(target: "webtor-engine", "http dial ok addr={addr} ms={}", dial_started.elapsed().as_millis());
+                tcp
+            }
+            Ok(Err(e)) => {
+                log::warn!(target: "webtor-engine", "http dial failed addr={addr} ms={} err={e:?}", dial_started.elapsed().as_millis());
+                return Err(TrackerError::Io(e));
+            }
+            Err(_) => {
+                log::warn!(target: "webtor-engine", "http dial timeout addr={addr} timeout_ms={}", self.timeout.as_millis());
+                return Err(TrackerError::Timeout);
+            }
+        };
 
         let host_hdr = if host_header.is_empty() {
             if (https && port == 443) || (!https && port == 80) {
@@ -347,10 +366,79 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "wt-discovery/0.1";
 
 fn map_reqwest(e: reqwest::Error, _timeout: Duration) -> TrackerError {
     if e.is_timeout() {
+        log::warn!(target: "webtor-engine", "http tracker timeout err={}", error_chain(&e));
         TrackerError::Timeout
     } else {
-        TrackerError::Other(e.to_string())
+        let kind = if e.is_connect() {
+            "connect"
+        } else if e.is_request() {
+            "request"
+        } else {
+            "other"
+        };
+        let chain = error_chain(&e);
+        log::warn!(target: "webtor-engine", "http tracker send failed kind={kind} err={chain}");
+        TrackerError::Other(chain)
     }
+}
+
+/// Display text of `e` followed by every `source()` (reqwest hides DNS and
+/// connect causes behind its top-level Display).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    strip_url_queries(&out)
+}
+
+/// Sustituye la query de cada URL embebida en `s` por `?<redacted>`:
+/// reqwest incluye la URL del tracker (con passkey) en sus mensajes de error.
+fn strip_url_queries(s: &str) -> String {
+    let is_delim = |c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | ',');
+    let mut out = String::with_capacity(s.len());
+    let mut token = String::new();
+    let mut in_query = false;
+    for c in s.chars() {
+        if is_delim(c) {
+            out.push_str(&token);
+            token.clear();
+            in_query = false;
+            out.push(c);
+        } else if in_query {
+            // Dentro de la query: descartar hasta el siguiente delimitador.
+        } else if c == '?' && token.contains("://") {
+            token.push_str("?<redacted>");
+            in_query = true;
+        } else {
+            token.push(c);
+        }
+    }
+    out.push_str(&token);
+    out
+}
+
+/// First 120 characters of a non-200 tracker body, for logs.
+fn body_preview(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let mut out: String = text.chars().take(120).collect();
+    if text.chars().count() > 120 {
+        out.push_str("...");
+    }
+    out
+}
+
+fn log_non_200(kind: &str, host: Option<&str>, status: u16, body: &[u8]) {
+    log::warn!(
+        target: "webtor-engine",
+        "http {kind} non-200 host={} status={status} body_len={} body={:?}",
+        host.unwrap_or("?"),
+        body.len(),
+        body_preview(body),
+    );
 }
 
 fn set_announce_params(url: &mut Url, ar: &AnnounceRequest, opts: &AnnounceOpt) {
@@ -623,5 +711,17 @@ mod tests {
         assert_eq!(resp.peers.len(), 1);
         assert_eq!(resp.peers[0].addr.port(), 6881);
         assert!(resp.peers[0].id.is_some());
+    }
+
+    #[test]
+    fn strip_url_queries_hides_passkey_and_keeps_text() {
+        let raw = "error sending request for url (https://t.example/announce?info_hash=ab&passkey=SECRET): connection refused";
+        let out = strip_url_queries(raw);
+        assert!(!out.contains("SECRET"), "{out}");
+        assert_eq!(
+            out,
+            "error sending request for url (https://t.example/announce?<redacted>): connection refused"
+        );
+        assert_eq!(strip_url_queries("no url here"), "no url here");
     }
 }

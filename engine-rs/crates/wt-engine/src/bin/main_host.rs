@@ -219,7 +219,31 @@ fn run_engine(args: HostArgs) -> i32 {
     })
 }
 
+/// Logger mínimo para el host: imprime a stderr los eventos `log::` del target
+/// `webtor-engine` (dial, peers, trackers, DHT) que en Android va a logcat.
+struct HostLogger;
+
+impl log::Log for HostLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.target() == "webtor-engine" && metadata.level() <= log::Level::Debug
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[webtor-engine] {}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static HOST_LOGGER: HostLogger = HostLogger;
+
 fn main() -> ExitCode {
+    if log::set_logger(&HOST_LOGGER).is_err() {
+        eprintln!("logger ya instalado; se usa el existente");
+    }
+    log::set_max_level(log::LevelFilter::Debug);
     let argv: Vec<String> = std::env::args().collect();
     let args = match parse_args(&argv) {
         Ok(a) => a,

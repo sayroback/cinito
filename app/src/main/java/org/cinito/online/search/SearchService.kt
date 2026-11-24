@@ -1,5 +1,7 @@
 package org.cinito.online.search
 
+import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -11,7 +13,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.cinito.online.metadata.AudioLanguageTag
 import org.cinito.online.metadata.MediaTitleParser
 import org.cinito.online.network.HardenedNetworkClient
+import org.cinito.online.network.NetworkSafety
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 enum class SearchSortOrder(val label: String) {
     BestPlayability("Mejor para reproducir"),
@@ -20,6 +24,32 @@ enum class SearchSortOrder(val label: String) {
     SizeDesc("Mayor tamaño"),
     SizeAsc("Menor tamaño"),
     TitleAsc("Título A-Z"),
+}
+
+/** Timeout de proveedor; su mensaje es el texto visible para el usuario. */
+class ProviderTimeoutException(message: String) : RuntimeException(message)
+
+/** Respuesta de proveedor que no pudo interpretarse. */
+class ProviderParseException(message: String, cause: Throwable?) : RuntimeException(message, cause)
+
+/** Resumen visible de un fallo de proveedor: clase y mensaje reales, con URLs redactadas. */
+internal fun failureSummary(e: Throwable): String =
+    if (e is ProviderTimeoutException) {
+        e.message.orEmpty()
+    } else {
+        NetworkSafety.redactUrl("${e::class.simpleName}: ${e.message}")
+    }
+
+/** Clase, mensaje y cadena de causas (hasta [maxLevels] niveles) para logs. */
+internal fun describeThrowable(e: Throwable, maxLevels: Int = 3): String {
+    val parts = ArrayList<String>(maxLevels)
+    var cur: Throwable? = e
+    while (cur != null && parts.size < maxLevels) {
+        val t: Throwable = cur
+        parts += "${t::class.simpleName}: ${NetworkSafety.redactUrl(t.message.toString())}"
+        cur = t.cause
+    }
+    return parts.joinToString(" <- causa: ")
 }
 
 data class ProviderFailure(
@@ -44,7 +74,56 @@ class SearchService(
     },
     private val titleResolver: (suspend (String, SearchCategory) -> SearchTitleResolution?)? = null,
     private val perProviderTimeoutMs: Long = 12_000L,
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
 ) {
+    private data class ProviderHealth(
+        val consecutiveFailures: Int = 0,
+        val openUntilMs: Long = 0L,
+        val ewmaLatencyMs: Double = 0.0,
+    )
+
+    private val providerHealth = ConcurrentHashMap<String, ProviderHealth>()
+
+    private fun isCircuitOpen(providerId: String): Boolean {
+        val h = providerHealth[providerId] ?: return false
+        return h.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD && clockMs() < h.openUntilMs
+    }
+
+    private fun adaptiveTimeoutMs(providerId: String): Long {
+        val ewma = providerHealth[providerId]?.ewmaLatencyMs ?: 0.0
+        if (ewma <= 0.0) return perProviderTimeoutMs
+        return (ewma * 2.5).toLong().coerceIn(MIN_ADAPTIVE_TIMEOUT_MS, perProviderTimeoutMs)
+    }
+
+    private fun recordProviderOutcome(providerId: String, success: Boolean, elapsedMs: Long) {
+        var transition: String? = null
+        providerHealth.compute(providerId) { _, prev ->
+            val cur = prev ?: ProviderHealth()
+            if (success) {
+                if (cur.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD) {
+                    transition = "circuit CLOSED provider=$providerId tras failures=${cur.consecutiveFailures}"
+                }
+                val nextEwma = if (cur.ewmaLatencyMs <= 0.0) {
+                    elapsedMs.toDouble()
+                } else {
+                    0.35 * elapsedMs + 0.65 * cur.ewmaLatencyMs
+                }
+                ProviderHealth(consecutiveFailures = 0, openUntilMs = 0L, ewmaLatencyMs = nextEwma)
+            } else {
+                val failures = cur.consecutiveFailures + 1
+                val openUntil = if (failures >= CIRCUIT_FAILURE_THRESHOLD) {
+                    transition = "circuit OPEN provider=$providerId failures=$failures cooldownMs=$CIRCUIT_COOLDOWN_MS"
+                    clockMs() + CIRCUIT_COOLDOWN_MS
+                } else {
+                    0L
+                }
+                cur.copy(consecutiveFailures = failures, openUntilMs = openUntil)
+            }
+        }
+        transition?.let { msg ->
+            if (msg.startsWith("circuit OPEN")) Log.w(TAG, msg) else Log.d(TAG, msg)
+        }
+    }
     constructor(
         network: HardenedNetworkClient,
         titleResolver: (suspend (String, SearchCategory) -> SearchTitleResolution?)? = null,
@@ -56,14 +135,28 @@ class SearchService(
             SolidTorrentsProvider(network),
             LimeTorrentsProvider(network),
             BitSearchProvider(network),
+            TorrentsCsvProvider(network),
             YtsProvider(network),
             NyaaProvider(network),
+            SukebeiProvider(network),
+            TheRarBgProvider(network),
             InternetArchiveProvider(network),
             SubsPleaseProvider(network),
         ),
         torznabFactory = { cfg -> TorznabSearchProvider(cfg, network) },
         titleResolver = titleResolver,
     )
+
+    private suspend fun searchQueries(
+        provider: TorrentSearchProvider,
+        queries: List<String>,
+        category: SearchCategory,
+        options: SearchRequestOptions,
+    ): List<TorrentSearchResult> = coroutineScope {
+        queries.map { q ->
+            async { provider.search(q, category, options) }
+        }.awaitAll().flatten()
+    }
 
     fun allBuiltinInfos(): List<SearchProviderInfo> = builtinProviders.map { it.info }
 
@@ -83,9 +176,14 @@ class SearchService(
         val provider = (builtinProviders + torznabConfigs.map(torznabFactory))
             .find { it.info.id == result.providerId }
             ?: return result
-        return runCatching {
+        return try {
             withTimeoutOrNull(6_000L) { provider.enrichResult(result) } ?: result
-        }.getOrDefault(result)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "enrich fallo provider=${provider.info.id} ${describeThrowable(e)}", e)
+            result
+        }
     }
 
     fun searchStreaming(
@@ -100,6 +198,10 @@ class SearchService(
         seasonHint: Int? = null,
         episodeHint: Int? = null,
         skipTitleResolution: Boolean = false,
+        broadGeneralSearch: Boolean = false,
+        hideAdultContent: Boolean = true,
+        adultOnly: Boolean = false,
+        disabledAdultProviderIds: Set<String> = emptySet(),
     ): Flow<SearchBatchUpdate> = channelFlow {
         val trimmed = query.trim()
         if (trimmed.isEmpty()) {
@@ -115,10 +217,19 @@ class SearchService(
             return@channelFlow
         }
 
+        val effectiveAdultOnly = !hideAdultContent && (adultOnly || category == SearchCategory.Adult)
+        val effectiveSkipTitleResolution = skipTitleResolution || effectiveAdultOnly
         val parsedQuery = MediaTitleParser.parse(trimmed)
-        val resolved = if (!skipTitleResolution && (imdbId.isNullOrBlank() || alternateQuery.isNullOrBlank())) {
+        val resolved = if (!effectiveSkipTitleResolution && (imdbId.isNullOrBlank() || alternateQuery.isNullOrBlank())) {
             withTimeoutOrNull(3_200L) {
-                runCatching { titleResolver?.invoke(trimmed, category) }.getOrNull()
+                try {
+                    titleResolver?.invoke(trimmed, category)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "resolución de título fallo ${describeThrowable(e)}", e)
+                    null
+                }
             }
         } else {
             null
@@ -143,9 +254,16 @@ class SearchService(
         }
 
         val providers = activeProviders(enabledProviderIds, torznabConfigs)
-            .filter { category == SearchCategory.All || category in it.info.categories }
             .filter {
-                languageFilter != SearchLanguageFilter.OnlyLatino ||
+                if (effectiveAdultOnly) {
+                    it.info.supportsAdultContent && it.info.id !in disabledAdultProviderIds
+                } else {
+                    category == SearchCategory.All || category in it.info.categories
+                }
+            }
+            .filter {
+                effectiveAdultOnly ||
+                    languageFilter != SearchLanguageFilter.OnlyLatino ||
                     it.info.supportsNonEnglishQueries ||
                     it.info.isTorznab
             }
@@ -172,12 +290,63 @@ class SearchService(
         val failures = mutableListOf<ProviderFailure>()
         var doneCount = 0
 
+        val requestOptions = SearchRequestOptions(
+            broadGeneralSearch = broadGeneralSearch,
+            hideAdultContent = if (effectiveAdultOnly) false else hideAdultContent,
+            adultOnly = effectiveAdultOnly,
+        )
+        val effectiveQueryLangFilter = if (effectiveAdultOnly) SearchLanguageFilter.AllLanguages else languageFilter
+
         coroutineScope {
             providers.map { provider ->
                 async {
-                    val outcome = runCatching {
-                        withTimeoutOrNull(perProviderTimeoutMs) {
-                            if (provider.info.supportsImdbSearch && effectiveImdbId != null) {
+                    if (isCircuitOpen(provider.info.id)) {
+                        Log.d(
+                            TAG,
+                            "skip provider=${provider.info.id} circuit=open failures=${providerHealth[provider.info.id]?.consecutiveFailures}",
+                        )
+                        mutex.withLock {
+                            doneCount++
+                            failures.add(
+                                ProviderFailure(
+                                    providerId = provider.info.id,
+                                    providerName = provider.info.name,
+                                    message = "Pausa temporal tras fallos repetidos",
+                                ),
+                            )
+                            val snapshot = applyLanguageFilterAndSort(
+                                results = deduplicateResults(aggregated),
+                                sortOrder = sortOrder,
+                                languageFilter = effectiveQueryLangFilter,
+                            )
+                            send(
+                                SearchBatchUpdate(
+                                    results = snapshot,
+                                    completedProviders = doneCount,
+                                    totalProviders = providers.size,
+                                    failures = failures.toList(),
+                                    isFinished = doneCount >= providers.size,
+                                    resolvedContext = resolutionBanner,
+                                ),
+                            )
+                        }
+                        return@async
+                    }
+                    val startedAt = clockMs()
+                    val timeoutMs = adaptiveTimeoutMs(provider.info.id)
+                    val queriesForProvider = buildQueriesForProvider(
+                        primary = trimmed,
+                        alternate = effectiveAlternate,
+                        languageFilter = effectiveQueryLangFilter,
+                        supportsNonEnglish = provider.info.supportsNonEnglishQueries || provider.info.isTorznab,
+                        maxQueries = provider.info.maxQueriesPerSearch,
+                    )
+                    Log.d(TAG, "start provider=${provider.info.id} queries=${queriesForProvider.size} timeoutMs=$timeoutMs")
+                    var phase = "init"
+                    val outcome: Result<List<TorrentSearchResult>> = try {
+                        val hits = withTimeoutOrNull(timeoutMs) {
+                            if (provider.info.supportsImdbSearch && effectiveImdbId != null && !effectiveAdultOnly) {
+                                phase = "imdb"
                                 val imdbHits = provider.searchByImdb(
                                     imdbId = effectiveImdbId,
                                     category = category,
@@ -188,52 +357,63 @@ class SearchService(
                                 if (imdbHits.isNotEmpty() || provider.info.requiresImdbSearch) {
                                     imdbHits
                                 } else {
-                                    val queriesForProvider = buildQueriesForProvider(
-                                        primary = trimmed,
-                                        alternate = effectiveAlternate,
-                                        languageFilter = languageFilter,
-                                        supportsNonEnglish = provider.info.supportsNonEnglishQueries || provider.info.isTorznab,
-                                        maxQueries = provider.info.maxQueriesPerSearch,
-                                    )
-                                    coroutineScope {
-                                        queriesForProvider.map { q ->
-                                            async { provider.search(q, category) }
-                                        }.awaitAll().flatten()
-                                    }
+                                    phase = "text"
+                                    searchQueries(provider, queriesForProvider, category, requestOptions)
                                 }
                             } else {
-                                val queriesForProvider = buildQueriesForProvider(
-                                    primary = trimmed,
-                                    alternate = effectiveAlternate,
-                                    languageFilter = languageFilter,
-                                    supportsNonEnglish = provider.info.supportsNonEnglishQueries || provider.info.isTorznab,
-                                    maxQueries = provider.info.maxQueriesPerSearch,
-                                )
-                                coroutineScope {
-                                    queriesForProvider.map { q ->
-                                        async { provider.search(q, category) }
-                                    }.awaitAll().flatten()
-                                }
+                                phase = "text"
+                                searchQueries(provider, queriesForProvider, category, requestOptions)
                             }
-                        } ?: throw IllegalStateException("Timeout (${perProviderTimeoutMs / 1000}s)")
+                        } ?: throw ProviderTimeoutException("Timeout (${timeoutMs / 1000}s) en fase $phase")
+                        Result.success(hits)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Result.failure(e)
                     }
+                    val elapsedMs = (clockMs() - startedAt).coerceAtLeast(1L)
+                    outcome.onSuccess { list ->
+                        Log.d(TAG, "ok provider=${provider.info.id} results=${list.size} elapsedMs=$elapsedMs")
+                    }.onFailure { err ->
+                        Log.w(
+                            TAG,
+                            "fail provider=${provider.info.id} fase=$phase elapsedMs=$elapsedMs ${describeThrowable(err)}",
+                            err,
+                        )
+                    }
+                    recordProviderOutcome(
+                        providerId = provider.info.id,
+                        success = outcome.isSuccess,
+                        elapsedMs = elapsedMs,
+                    )
                     mutex.withLock {
                         doneCount++
                         outcome.onSuccess { list ->
-                            aggregated.addAll(list)
+                            val filteredList = when {
+                                effectiveAdultOnly && !provider.info.hasStrictAdultCategory ->
+                                    list.filter {
+                                        it.category == SearchCategory.Adult ||
+                                            SearchUtils.isAdultContent(it.title, it.description)
+                                    }
+                                effectiveAdultOnly -> list
+                                hideAdultContent ->
+                                    list.filterNot { SearchUtils.isAdultContent(it.title, it.description) }
+                                else -> list
+                            }
+                            aggregated.addAll(filteredList)
                         }.onFailure { err ->
                             failures.add(
                                 ProviderFailure(
                                     providerId = provider.info.id,
                                     providerName = provider.info.name,
-                                    message = org.cinito.online.network.NetworkSafety.redactUrl(err.message ?: "Error de red"),
+                                    message = failureSummary(err),
                                 ),
                             )
                         }
                         val snapshot = applyLanguageFilterAndSort(
                             results = deduplicateResults(aggregated),
                             sortOrder = sortOrder,
-                            languageFilter = languageFilter,
+                            languageFilter = effectiveQueryLangFilter,
                         )
                         send(
                             SearchBatchUpdate(
@@ -252,6 +432,10 @@ class SearchService(
     }
 
     companion object {
+        private const val TAG = "SearchService"
+        private const val CIRCUIT_FAILURE_THRESHOLD = 2
+        private const val CIRCUIT_COOLDOWN_MS = 120_000L
+        private const val MIN_ADAPTIVE_TIMEOUT_MS = 3_500L
         private val EXPLICIT_LANG_TOKEN = Regex("""(?i)\b(latino|lat|castellano|espa[nñ]ol|espanol|dual|vose|sub)\b""")
         private val TRAILING_YEAR_REGEX = Regex("""\s+(?:19|20)\d{2}$""")
 
@@ -429,17 +613,24 @@ class SearchService(
             if (languageFilter != SearchLanguageFilter.PrioritizeLatino) return baseSorted to assessments
 
             // When prioritizing Latino in BestPlayability, push Dead (0 live seeders) below playable releases
+            // and rank Tier 0 (verified live flow) ahead of Tier 1 (unprobed/unverified)
             val finalSorted = if (sortOrder == SearchSortOrder.BestPlayability) {
                 baseSorted.sortedWith(
                     compareBy<TorrentSearchResult> { assessments[it.id]?.verdict == PlayabilityVerdict.Dead }
+                        .thenBy { !hasVerifiedFlow(assessments[it.id]) }
                         .thenBy { tagPriority(it.languageTag) }
-                        .thenByDescending { assessments[it.id]?.score ?: 0 },
+                        .thenByDescending { assessments[it.id]?.score ?: 0 }
+                        .thenByDescending { assessments[it.id]?.probe?.measuredDownloadBps ?: 0L }
+                        .thenByDescending { assessments[it.id]?.effectiveSeeders ?: it.seeders },
                 )
             } else {
                 baseSorted.sortedBy { tagPriority(it.languageTag) }
             }
             return finalSorted to assessments
         }
+
+        private fun hasVerifiedFlow(assessment: PlayabilityAssessment?): Boolean =
+            (assessment?.probe?.measuredDownloadBps ?: 0L) > 0L
 
         private fun tagPriority(tag: AudioLanguageTag): Int = when (tag) {
             AudioLanguageTag.Latino -> 0
@@ -455,9 +646,14 @@ class SearchService(
             assessments: Map<String, PlayabilityAssessment> = emptyMap(),
         ): List<TorrentSearchResult> = when (sortOrder) {
             SearchSortOrder.BestPlayability -> results.sortedWith(
-                compareByDescending<TorrentSearchResult> {
-                    assessments[it.id]?.score ?: PlayabilityScorer.evaluate(it).score
+                compareBy<TorrentSearchResult> {
+                    (assessments[it.id] ?: PlayabilityScorer.evaluate(it)).verdict == PlayabilityVerdict.Dead
                 }
+                    .thenBy { !hasVerifiedFlow(assessments[it.id]) }
+                    .thenByDescending {
+                        assessments[it.id]?.score ?: PlayabilityScorer.evaluate(it).score
+                    }
+                    .thenByDescending { assessments[it.id]?.probe?.measuredDownloadBps ?: 0L }
                     .thenByDescending { assessments[it.id]?.effectiveSeeders ?: it.seeders }
                     .thenByDescending { it.uploadDateEpochSec ?: 0L },
             )

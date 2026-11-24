@@ -116,6 +116,7 @@ fun GalleryLibraryScreen(
     onNavigateSearch: () -> Unit,
     castState: CastSessionState = CastSessionState(),
     onOpenCast: (() -> Unit)? = null,
+    hiddenAdultCount: Int = 0,
 ) {
     val context = LocalContext.current
     val app = remember(context) { context.applicationContext as webtor.app.WebtorApp }
@@ -238,6 +239,15 @@ fun GalleryLibraryScreen(
                     ),
                 )
             }
+        }
+
+        if (hiddenAdultCount > 0) {
+            Text(
+                text = "$hiddenAdultCount ocultos por filtro +18",
+                style = MaterialTheme.typography.labelSmall,
+                color = CinemaColors.TextSecondary,
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp),
+            )
         }
 
         if (cards.isEmpty() && continueTargets.isEmpty()) {

@@ -112,6 +112,9 @@ fun CatalogDetailsScreen(
     onInspectResult: (TorrentSearchResult) -> Unit,
     onDiagnoseTop: (() -> Unit)? = null,
     onDiagnoseResult: ((TorrentSearchResult) -> Unit)? = null,
+    onStartScan: ((Int) -> Unit)? = null,
+    onPauseScan: (() -> Unit)? = null,
+    onResumeScan: (() -> Unit)? = null,
     onStreamResult: (TorrentSearchResult, Int?, Int?, String) -> Unit,
     onChooseFilesResult: (TorrentSearchResult, String) -> Unit,
     onOpenLibraryEntry: (DownloadEntry) -> Unit,
@@ -239,7 +242,7 @@ fun CatalogDetailsScreen(
     val activeEpisodeMeta = remember(episodesForSeason, detail.selectedEpisode) {
         detail.selectedEpisode?.let { ep -> episodesForSeason.find { it.episode == ep } }
     }
-    val displayList = remember(sortedResults, assessmentsById, media, detail.showAllResults) {
+    val latestDisplayList = remember(sortedResults, assessmentsById, media, detail.showAllResults) {
         filterCatalogDetailResults(
             sortedResults = sortedResults,
             assessmentsById = assessmentsById,
@@ -247,6 +250,27 @@ fun CatalogDetailsScreen(
             showAllResults = detail.showAllResults,
         )
     }
+    val latestIds = remember(latestDisplayList) { latestDisplayList.map { it.id } }
+    val latestById = remember(latestDisplayList) { latestDisplayList.associateBy { it.id } }
+    var anchoredIds by remember(
+        detail.cacheKey,
+        detail.selectedSeason,
+        detail.selectedEpisode,
+        detail.sortOrder,
+        detail.languageFilter,
+        detail.showAllResults,
+    ) { mutableStateOf(latestIds) }
+    LaunchedEffect(latestIds, listState.firstVisibleItemIndex, listState.isScrollInProgress, detail.isSearching) {
+        val atTop = listState.firstVisibleItemIndex <= 2 && !listState.isScrollInProgress
+        val noProbesYet = detail.probeResultsByHash.isEmpty()
+        val scanning = detail.swarmScan.status == SwarmScanStatus.Running
+        // A single-card test must update in place; reorder only on demand, while scanning at top, or before any probe.
+        if (anchoredIds.isEmpty() || detail.isSearching || noProbesYet || (scanning && atTop)) {
+            anchoredIds = latestIds
+        }
+    }
+    val displayList = remember(anchoredIds, latestById) { anchoredIds.mapNotNull { latestById[it] } }
+    val hasPendingReorder = anchoredIds != latestIds
 
     val targetLabel = remember(media.type, detail.selectedSeason, detail.selectedEpisode, activeEpisodeMeta) {
         if (media.type != "series") {
@@ -723,7 +747,55 @@ fun CatalogDetailsScreen(
                         )
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (onDiagnoseTop != null && sortedResults.isNotEmpty() && !detail.isSearching) {
+                        if (hasPendingReorder) {
+                            TextButton(
+                                onClick = { anchoredIds = latestIds },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            ) {
+                                Text(
+                                    text = "Mover ↑",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = CinemaColors.PrimarySoft,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                        if (onStartScan != null && sortedResults.isNotEmpty() && !detail.isSearching) {
+                            val scan = detail.swarmScan
+                            if (scan.status == SwarmScanStatus.Idle || scan.status == SwarmScanStatus.Completed) {
+                                if (scan.status == SwarmScanStatus.Completed) {
+                                    Text(
+                                        text = "✓${scan.ok} ✗${scan.dead}",
+                                        style = MaterialTheme.typography.labelMedium.tabular(),
+                                        color = CinemaColors.TextSecondary,
+                                        maxLines = 1,
+                                    )
+                                }
+                                if (scan.status == SwarmScanStatus.Idle) {
+                                    listOf(3, 5).forEach { n ->
+                                        TextButton(
+                                            onClick = { onStartScan(n) },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                        ) {
+                                            Text("▶ Probar $n", style = MaterialTheme.typography.labelMedium, color = CinemaColors.Secondary, maxLines = 1)
+                                        }
+                                    }
+                                }
+                            } else {
+                                val running = scan.status == SwarmScanStatus.Running
+                                TextButton(
+                                    onClick = { (if (running) onPauseScan else onResumeScan)?.invoke() },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                ) {
+                                    Text(
+                                        text = if (running) "⏸ ${scan.done}/${scan.total}" else "▶ Siguientes · ${scan.done}/${scan.total} ✓${scan.ok}",
+                                        style = MaterialTheme.typography.labelMedium.tabular(),
+                                        color = if (running) CinemaColors.Gold else CinemaColors.Secondary,
+                                        maxLines = 1,
+                                    )
+                                }
+                            }
+                        } else if (onStartScan == null && onDiagnoseTop != null && sortedResults.isNotEmpty() && !detail.isSearching) {
                             val isProbing = detail.probingHashes.isNotEmpty()
                             TextButton(
                                 enabled = !isProbing,

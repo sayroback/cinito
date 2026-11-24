@@ -66,7 +66,9 @@ impl EngineServer {
             };
             if let Some(save) = pending {
                 // Hashing and fsync must not occupy a reactor thread.
-                let _ = tokio::task::spawn_blocking(move || server.persist_resume(save)).await;
+                if let Err(err) = tokio::task::spawn_blocking(move || server.persist_resume(save)).await {
+                    crate::jni::log_warn(&format!("resume save task failed: {err}"));
+                }
             }
         });
     }
@@ -165,16 +167,18 @@ impl EngineServer {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            if let Err(err) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+                crate::jni::log_warn(&format!("resume dir chmod 0700 failed path={}: {err}", dir.display()));
+            }
         }
         if wt_storage::save_resume_window(&self.download_dir, &meta, &bytes).is_ok() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    dir.join("window.bin"),
-                    std::fs::Permissions::from_mode(0o600),
-                );
+                let window = dir.join("window.bin");
+                if let Err(err) = std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o600)) {
+                    crate::jni::log_warn(&format!("resume window chmod 0600 failed path={}: {err}", window.display()));
+                }
             }
             state.known.insert(hash, meta);
         }
@@ -214,7 +218,16 @@ impl EngineServer {
         if wt_storage::file_size(&path) > RESUME_WINDOW_MAX_BYTES + (64 << 10) + 4 {
             return None;
         }
-        let (meta, bytes) = wt_storage::load_resume_window(&self.download_dir, &hash).ok()?;
+        let (meta, bytes) = match wt_storage::load_resume_window(&self.download_dir, &hash) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                crate::jni::log_debug(&format!(
+                    "resume window unavailable hash={}: {err}",
+                    super::short_hash(&hash)
+                ));
+                return None;
+            }
+        };
         if !valid(&meta) {
             return None;
         }
@@ -238,7 +251,12 @@ impl EngineServer {
         state.clear_generation += 1;
         state.pending.remove(info_hash);
         state.known.remove(info_hash);
-        let _ = wt_storage::delete_resume_window(&self.download_dir, info_hash);
+        if let Err(err) = wt_storage::delete_resume_window(&self.download_dir, info_hash) {
+            crate::jni::log_warn(&format!(
+                "cleanup resume window failed hash={}: {err}",
+                super::short_hash(info_hash)
+            ));
+        }
     }
 
     pub(super) fn protected_resume_hashes(&self) -> HashSet<String> {
@@ -267,7 +285,7 @@ impl EngineServer {
                 if entry.file_type().is_ok_and(|kind| kind.is_dir())
                     && !protected.contains(&entry.file_name().to_string_lossy().into_owned())
                 {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                    super::remove_temp_dir("resume-window-inactive", "-", &entry.path());
                 }
             }
         }
@@ -327,7 +345,7 @@ impl EngineServer {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if entry.path().is_dir() && !protected.contains(&name) {
-                let _ = std::fs::remove_dir_all(entry.path());
+                super::remove_temp_dir("startup-inactive", "-", &entry.path());
             }
         }
     }

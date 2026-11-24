@@ -39,8 +39,8 @@ class NextEpisodeWarmTest {
         val planned = NextPreload(fileIndex = 1, active = false, ready = false)
         assertNull(upNextLabel(null, 1))
         assertNull(upNextLabel(planned, 0))
-        assertEquals("Up next · loads near the end", upNextLabel(planned, 1))
-        assertEquals("Up next · loading start", upNextLabel(planned.copy(active = true), 1))
-        assertEquals("Up next · start loaded", upNextLabel(planned.copy(active = true, ready = true), 1))
+        assertEquals("Siguiente · se carga cerca del final", upNextLabel(planned, 1))
+        assertEquals("Siguiente · cargando inicio", upNextLabel(planned.copy(active = true), 1))
+        assertEquals("Siguiente · inicio cargado", upNextLabel(planned.copy(active = true, ready = true), 1))
     }
 }

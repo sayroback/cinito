@@ -32,6 +32,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -42,6 +43,8 @@ import org.cinito.online.metadata.AudioTrackProbeRepository
 import org.cinito.online.metadata.ContainerProbeResult
 import org.cinito.online.search.PlayabilityAssessment
 import org.cinito.online.search.PlayabilityVerdict
+import org.cinito.online.search.SearchCategory
+import org.cinito.online.search.SearchUtils
 import org.cinito.online.search.TorrentSearchResult
 import org.cinito.online.ui.library.AudioLanguageBadge
 import org.cinito.online.ui.library.CandidateAudioProbeButton
@@ -49,6 +52,7 @@ import org.cinito.online.ui.library.InlineTrackBreakdownPanel
 import org.cinito.online.ui.theme.CinemaColors
 import org.cinito.online.ui.theme.tabular
 import webtor.app.WebtorApp
+import webtor.app.formatSpeed
 import java.util.Locale
 
 private val REDUNDANT_LANGUAGE_BADGES = setOf(
@@ -119,14 +123,23 @@ fun TorrentReleaseCard(
             ?.takeIf { it.isNotEmpty() }
     }
 
+    val isDead = assessment?.verdict == PlayabilityVerdict.Dead
+    val probe = assessment?.probe
+    val isVerifiedWorking = !isProbingSwarm && probe != null && probe.measuredDownloadBps > 0L
+    val isFailedDead = !isProbingSwarm && !isVerifiedWorking && isDead
+
     Surface(
         onClick = onStream,
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .then(if (isFailedDead) Modifier.alpha(0.58f) else Modifier),
         shape = RoundedCornerShape(14.dp),
         color = CinemaColors.Surface,
         border = BorderStroke(
-            width = if (isTopRecommended) 1.25.dp else 1.dp,
+            width = if (isProbingSwarm || isVerifiedWorking || isTopRecommended) 1.25.dp else 1.dp,
             color = when {
+                isProbingSwarm -> CinemaColors.Gold.copy(alpha = 0.72f)
+                isVerifiedWorking -> CinemaColors.Secondary.copy(alpha = 0.65f)
                 inLibrary -> CinemaColors.Secondary.copy(alpha = 0.48f)
                 isTopRecommended -> CinemaColors.Secondary.copy(alpha = 0.55f)
                 else -> CinemaColors.HairlineBorder
@@ -170,6 +183,21 @@ fun TorrentReleaseCard(
                             null
                         },
                     )
+                    if (result.category == SearchCategory.Adult || SearchUtils.isAdultContent(result.title, result.description)) {
+                        Surface(
+                            shape = RoundedCornerShape(7.dp),
+                            color = CinemaColors.Danger.copy(alpha = 0.16f),
+                            border = BorderStroke(1.dp, CinemaColors.Danger.copy(alpha = 0.42f)),
+                        ) {
+                            Text(
+                                text = "+18",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CinemaColors.Danger,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                            )
+                        }
+                    }
                     if (inLibrary) {
                         Surface(
                             shape = RoundedCornerShape(7.dp),
@@ -200,12 +228,21 @@ fun TorrentReleaseCard(
 
                 Spacer(Modifier.width(8.dp))
 
-                PlayabilityConnectionsBadge(
+                SwarmTelemetryCluster(
                     verdict = assessment?.verdict,
                     seeders = shownSeeders,
                     peers = shownPeers,
                     isLiveScraped = isLiveScraped,
                     isTopRecommended = isTopRecommended,
+                    isProbingSwarm = isProbingSwarm,
+                    isVerifiedWorking = isVerifiedWorking,
+                    isFailedDead = isFailedDead,
+                    measuredDownloadBps = probe?.measuredDownloadBps,
+                    connectedSeeders = probe?.connectedSeeders,
+                    connectedPeersNoFlow = if (probe != null && !probe.isPolicyBlocked && probe.measuredDownloadBps <= 0L &&
+                        probe.activePeers > 0 && probe.targetFileSizeBytes != null
+                    ) probe.activePeers else null,
+                    onDiagnoseSwarm = onDiagnoseSwarm,
                 )
             }
 
@@ -296,14 +333,6 @@ fun TorrentReleaseCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    if (isProbingSwarm) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(14.dp),
-                            strokeWidth = 1.5.dp,
-                            color = CinemaColors.Gold,
-                        )
-                    }
-
                     CandidateAudioProbeButton(
                         magnetUri = result.magnetUri,
                         infoHash = result.infoHash,
@@ -415,6 +444,188 @@ private fun SubtitleTrackBadge(
                 fontWeight = if (hasSpanishSub) FontWeight.SemiBold else FontWeight.Normal,
                 maxLines = 1,
             )
+        }
+    }
+}
+
+@Composable
+private fun SwarmTelemetryCluster(
+    verdict: PlayabilityVerdict?,
+    seeders: Int,
+    peers: Int,
+    isLiveScraped: Boolean,
+    isTopRecommended: Boolean,
+    isProbingSwarm: Boolean,
+    isVerifiedWorking: Boolean,
+    isFailedDead: Boolean,
+    measuredDownloadBps: Long?,
+    connectedSeeders: Int?,
+    connectedPeersNoFlow: Int? = null,
+    onDiagnoseSwarm: (() -> Unit)?,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        when {
+            isProbingSwarm -> {
+                Surface(
+                    shape = RoundedCornerShape(7.dp),
+                    color = CinemaColors.Gold.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, CinemaColors.Gold.copy(alpha = 0.45f)),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(11.dp),
+                            strokeWidth = 1.5.dp,
+                            color = CinemaColors.Gold,
+                        )
+                        Text(
+                            text = "Probando… · ↑$seeders",
+                            style = MaterialTheme.typography.labelSmall.tabular(),
+                            color = CinemaColors.Gold,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                        )
+                    }
+                }
+            }
+
+            isVerifiedWorking && measuredDownloadBps != null -> {
+                Surface(
+                    shape = RoundedCornerShape(7.dp),
+                    color = CinemaColors.Secondary.copy(alpha = 0.18f),
+                    border = BorderStroke(1.dp, CinemaColors.Secondary.copy(alpha = 0.38f)),
+                ) {
+                    Text(
+                        text = "✓ ↓ ${formatSpeed(measuredDownloadBps)} · ↑${connectedSeeders ?: seeders}",
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = CinemaColors.Secondary,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                    )
+                }
+                if (onDiagnoseSwarm != null) {
+                    Surface(
+                        onClick = onDiagnoseSwarm,
+                        shape = RoundedCornerShape(7.dp),
+                        color = CinemaColors.SurfaceBright,
+                        border = BorderStroke(1.dp, CinemaColors.HairlineBorder),
+                    ) {
+                        Text(
+                            text = "↺",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CinemaColors.TextSecondary,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                        )
+                    }
+                }
+            }
+
+            isFailedDead -> {
+                val failLabel = if (measuredDownloadBps != null) {
+                    "✗ 0 B/s · ↑$seeders"
+                } else {
+                    "Sin fuentes"
+                }
+                Surface(
+                    shape = RoundedCornerShape(7.dp),
+                    color = CinemaColors.Danger.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, CinemaColors.Danger.copy(alpha = 0.42f)),
+                ) {
+                    Text(
+                        text = failLabel,
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = CinemaColors.Danger,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                    )
+                }
+                if (onDiagnoseSwarm != null) {
+                    Surface(
+                        onClick = onDiagnoseSwarm,
+                        shape = RoundedCornerShape(7.dp),
+                        color = CinemaColors.SurfaceElevated,
+                        border = BorderStroke(1.dp, CinemaColors.Danger.copy(alpha = 0.35f)),
+                    ) {
+                        Text(
+                            text = "Reintentar",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CinemaColors.Danger,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                        )
+                    }
+                }
+            }
+
+            connectedPeersNoFlow != null && !isFailedDead -> {
+                Surface(
+                    shape = RoundedCornerShape(7.dp),
+                    color = CinemaColors.Gold.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, CinemaColors.Gold.copy(alpha = 0.45f)),
+                ) {
+                    Text(
+                        text = "◐ $connectedPeersNoFlow peers · sin flujo aún",
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = CinemaColors.Gold,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                    )
+                }
+                if (onDiagnoseSwarm != null) {
+                    Surface(
+                        onClick = onDiagnoseSwarm,
+                        shape = RoundedCornerShape(7.dp),
+                        color = CinemaColors.SurfaceBright,
+                        border = BorderStroke(1.dp, CinemaColors.HairlineBorder),
+                    ) {
+                        Text(
+                            text = "↺",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CinemaColors.TextSecondary,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                        )
+                    }
+                }
+            }
+
+            else -> {
+                PlayabilityConnectionsBadge(
+                    verdict = verdict,
+                    seeders = seeders,
+                    peers = peers,
+                    isLiveScraped = isLiveScraped,
+                    isTopRecommended = isTopRecommended,
+                )
+                if (onDiagnoseSwarm != null) {
+                    Surface(
+                        onClick = onDiagnoseSwarm,
+                        shape = RoundedCornerShape(7.dp),
+                        color = CinemaColors.SurfaceElevated,
+                        border = BorderStroke(1.dp, CinemaColors.HairlineBorderStrong),
+                    ) {
+                        Text(
+                            text = "Probar",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CinemaColors.PrimarySoft,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                        )
+                    }
+                }
+            }
         }
     }
 }

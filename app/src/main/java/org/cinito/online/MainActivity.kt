@@ -116,6 +116,7 @@ import org.cinito.online.player.CinemaPlayerUiLogic
 import org.cinito.online.player.SubtitleSource
 import org.cinito.online.search.SearchCategory
 import org.cinito.online.search.SearchLanguageFilter
+import org.cinito.online.search.SearchUtils
 import org.cinito.online.search.SwarmDiagnosticsCoordinator
 import org.cinito.online.search.TorrentSearchResult
 import org.cinito.online.settings.AppPreferences
@@ -937,7 +938,48 @@ class MainActivity : ComponentActivity() {
                         onDirectPlay = session::startDirectPlay,
                         directPlayDefault = engineState.directPlayDefault,
                         onCancel = session::cancelPrepare,
+                        onPlayFile = session::playPreparedFile,
                     )
+                } else if (engineState.prepareMode == PrepareMode.ChooseFiles) {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        Box(modifier = Modifier.weight(1f).fillMaxSize()) {
+                            val prepareHash = engineState.prepare?.torrent?.infoHash?.trim()?.lowercase()
+                            val cachedPrepareProbe = prepareHash?.let { searchState.probeResultsByHash[it] }
+                            ChooseFilesOverlay(
+                                targetTitle = engineState.quickStreamTarget?.displayTitle,
+                                target = engineState.quickStreamTarget,
+                                draft = engineState.prepare,
+                                error = engineState.error,
+                                sourceStatus = engineState.sourceStatus,
+                                freeBytes = engineState.freeBytes,
+                                destination = engineState.storageFolderName,
+                                directPlayDefault = engineState.directPlayDefault,
+                                onToggle = session::toggleFile,
+                                onSelectAll = session::selectAllFiles,
+                                onSelectNone = session::selectNoFiles,
+                                onSelectVideos = session::selectVideoFiles,
+                                onDirectPlay = session::startDirectPlay,
+                                onDownload = session::startDownload,
+                                onPlayFile = session::playPreparedFile,
+                                onRetry = session::retryQuickPrepare,
+                                onCancel = session::cancelQuickPrepare,
+                                cachedProbe = cachedPrepareProbe,
+                                onMeasureSwarm = {
+                                    val d = engineState.prepare
+                                    if (d != null) {
+                                        vm.explore.measurePreparedSwarm(d.engineId, d.torrent?.infoHash ?: d.source)
+                                    }
+                                },
+                            )
+                        }
+                        ActiveCastMiniBar(
+                            castState = castState,
+                            onOpenRemote = { showGlobalCastRemote = true },
+                            onTogglePlayPause = app.castManager::togglePlayPause,
+                            onNextEpisode = nextCastEpisodeFn,
+                            onStopCasting = stopOrDisconnectCast,
+                        )
+                    }
                 } else if (filesEntry != null) {
                     Column(modifier = Modifier.fillMaxSize()) {
                         Box(modifier = Modifier.weight(1f).fillMaxSize()) {
@@ -1033,35 +1075,6 @@ class MainActivity : ComponentActivity() {
                             onStopCasting = stopOrDisconnectCast,
                         )
                     }
-                } else if (engineState.prepareMode == PrepareMode.ChooseFiles) {
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        Box(modifier = Modifier.weight(1f).fillMaxSize()) {
-                            ChooseFilesOverlay(
-                                targetTitle = engineState.quickStreamTarget?.displayTitle,
-                                draft = engineState.prepare,
-                                error = engineState.error,
-                                sourceStatus = engineState.sourceStatus,
-                                freeBytes = engineState.freeBytes,
-                                destination = engineState.storageFolderName,
-                                directPlayDefault = engineState.directPlayDefault,
-                                onToggle = session::toggleFile,
-                                onSelectAll = session::selectAllFiles,
-                                onSelectNone = session::selectNoFiles,
-                                onSelectVideos = session::selectVideoFiles,
-                                onDirectPlay = session::startDirectPlay,
-                                onDownload = session::startDownload,
-                                onRetry = session::retryQuickPrepare,
-                                onCancel = session::cancelQuickPrepare,
-                            )
-                        }
-                        ActiveCastMiniBar(
-                            castState = castState,
-                            onOpenRemote = { showGlobalCastRemote = true },
-                            onTogglePlayPause = app.castManager::togglePlayPause,
-                            onNextEpisode = nextCastEpisodeFn,
-                            onStopCasting = stopOrDisconnectCast,
-                        )
-                    }
                 } else if (currentTab == MainTab.Discover && activeCatalogDetail != null) {
                     Column(modifier = Modifier.fillMaxSize()) {
                         Box(modifier = Modifier.weight(1f).fillMaxSize()) {
@@ -1082,6 +1095,9 @@ class MainActivity : ComponentActivity() {
                                 onInspectResult = vm.explore::enrichDetailResult,
                                 onDiagnoseTop = { vm.explore.diagnoseDetailTop() },
                                 onDiagnoseResult = vm.explore::diagnoseDetailCandidate,
+                                onStartScan = { n -> vm.explore.startProgressiveDetailScan(batchSize = n) },
+                                onPauseScan = vm.explore::pauseDetailScan,
+                                onResumeScan = vm.explore::resumeDetailScan,
                                 onStreamResult = { res, season, ep, titleLabel ->
                                     openSearchResult(
                                         result = res,
@@ -1216,8 +1232,18 @@ class MainActivity : ComponentActivity() {
                                 saveableStateHolder.SaveableStateProvider(currentTab.name) {
                                 when (currentTab) {
                                     MainTab.Library -> {
-                                        val visibleEntries = remember(engineState.library, libraryFilter, librarySort, librarySearchQuery) {
-                                            engineState.library
+                                        val libraryEntries = remember(engineState.library, prefs.hideAdultContent) {
+                                            if (prefs.hideAdultContent) {
+                                                engineState.library.filterNot { SearchUtils.isAdultContent(it.title) }
+                                            } else {
+                                                engineState.library
+                                            }
+                                        }
+                                        val hiddenAdultCount = remember(engineState.library, libraryEntries) {
+                                            (engineState.library.size - libraryEntries.size).coerceAtLeast(0)
+                                        }
+                                        val visibleEntries = remember(libraryEntries, libraryFilter, librarySort, librarySearchQuery) {
+                                            libraryEntries
                                                 .applyFilter(libraryFilter)
                                                 .filterLibrary(librarySearchQuery)
                                                 .stableLibrarySort(librarySort)
@@ -1230,7 +1256,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                         GalleryLibraryScreen(
                                             cards = galleryCards,
-                                            rawEntries = engineState.library,
+                                            rawEntries = libraryEntries,
                                             metadataMap = metadataMap,
                                             viewMode = prefs.libraryViewMode,
                                             filter = libraryFilter,
@@ -1251,6 +1277,7 @@ class MainActivity : ComponentActivity() {
                                             onNavigateSearch = { currentTab = MainTab.Search },
                                             castState = castState,
                                             onOpenCast = { showGlobalCastDevices = true },
+                                            hiddenAdultCount = hiddenAdultCount,
                                         )
                                     }
 
@@ -1282,8 +1309,13 @@ class MainActivity : ComponentActivity() {
                                         state = searchState,
                                         recentQueries = prefs.recentSearchQueries,
                                         enabledProviderIds = prefs.enabledProviderIds,
+                                        disabledAdultProviderIds = prefs.disabledAdultProviderIds,
                                         torznabConfigs = torznabConfigs,
                                         library = engineState.library,
+                                        hideAdultContent = prefs.hideAdultContent,
+                                        adultOnlySearch = prefs.adultOnlySearch,
+                                        onDisableAdultOnlySearch = { app.appSettings.setAdultOnlySearch(false) },
+                                        onToggleHideDeadResults = vm.explore::setHideDeadSearchResults,
                                         isCastingToTv = castState.isConnected,
                                         activeWebOsMode = if (castState.isConnected) castState.activeWebOsMode else null,
                                         castState = castState,
@@ -1298,6 +1330,9 @@ class MainActivity : ComponentActivity() {
                                         onInspectResult = vm.explore::enrichSearchResult,
                                         onDiagnoseTop = { vm.explore.diagnoseSearchTop() },
                                         onDiagnoseResult = vm.explore::diagnoseSearchCandidate,
+                                        onStartScan = { n -> vm.explore.startProgressiveSearchScan(batchSize = n) },
+                                        onPauseScan = vm.explore::pauseSearchScan,
+                                        onResumeScan = vm.explore::resumeSearchScan,
                                         onStreamResult = { res, season, ep ->
                                             openSearchResult(
                                                 result = res,
@@ -1365,7 +1400,11 @@ class MainActivity : ComponentActivity() {
                                             vm.explore.clearMetadataCacheAndReload(reloadDiscover = false)
                                         },
                                         onShowRawFilenames = app.appSettings::setShowRawFilenames,
+                                        onBroadGeneralSearch = app.appSettings::setBroadGeneralSearchEnabled,
+                                        onHideAdultContent = app.appSettings::setHideAdultContent,
+                                        onAdultOnlySearch = app.appSettings::setAdultOnlySearch,
                                         onToggleProvider = app.appSettings::toggleSearchProvider,
+                                        onToggleAdultProvider = app.appSettings::setAdultProviderEnabled,
                                         onAddTorznab = { name, url, apiKey, cats ->
                                             app.torznabStore.addOrUpdate(name, url, apiKey, cats)
                                         },
@@ -1634,11 +1673,15 @@ class MainActivity : ComponentActivity() {
                 displayTitle = titleLabel,
                 season = season,
                 episode = episode,
+                reportedSeeders = result.seeders,
+                reportedPeers = result.peers,
             )
         } else {
             session.openFileChooserForMagnet(
                 torrentId = result.magnetUri,
                 displayTitle = titleLabel,
+                reportedSeeders = result.seeders,
+                reportedPeers = result.peers,
             )
         }
     }

@@ -48,7 +48,6 @@ import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -59,10 +58,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -71,8 +70,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.cinito.online.metadata.AudioTrackProbeRepository
+import org.cinito.online.search.PlayabilityScorer
+import org.cinito.online.search.SwarmProbeResult
 import org.cinito.online.ui.library.InlineTrackBreakdownPanel
 import org.cinito.online.ui.library.VerifiedAudioSummaryPill
 import org.cinito.online.ui.library.isInspectableContainerName
@@ -83,9 +85,11 @@ import webtor.app.PrepareDraft
 import webtor.app.QuickStreamTarget
 import webtor.app.WebtorApp
 import webtor.app.formatBytes
+import webtor.app.formatSpeed
 import webtor.app.isAudioName
 import webtor.app.isSubtitleName
 import webtor.app.isVideoName
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -99,19 +103,30 @@ fun QuickStreamSheet(
     onCancel: () -> Unit,
 ) {
     val busy = draft?.busy == true
-    val currentBusy by rememberUpdatedState(busy)
     val sheetState = rememberModalBottomSheetState(
         skipPartiallyExpanded = true,
-        confirmValueChange = { targetValue -> !currentBusy || targetValue != SheetValue.Hidden },
+        confirmValueChange = { true },
     )
+    var elapsedSec by remember(draft?.startedAtMs) {
+        mutableIntStateOf(
+            draft?.startedAtMs?.let { ((System.currentTimeMillis() - it) / 1000L).toInt().coerceAtLeast(0) } ?: 0,
+        )
+    }
+    LaunchedEffect(draft?.startedAtMs) {
+        val start = draft?.startedAtMs ?: return@LaunchedEffect
+        while (true) {
+            elapsedSec = ((System.currentTimeMillis() - start) / 1000L).toInt().coerceAtLeast(0)
+            delay(1_000L)
+        }
+    }
     ModalBottomSheet(
-        onDismissRequest = { if (!busy) onCancel() },
+        onDismissRequest = onCancel,
         sheetState = sheetState,
-        properties = ModalBottomSheetProperties(shouldDismissOnBackPress = !busy),
+        properties = ModalBottomSheetProperties(shouldDismissOnBackPress = true),
         containerColor = CinemaColors.Surface,
         contentColor = CinemaColors.TextPrimary,
     ) {
-        BackHandler(enabled = !busy, onBack = onCancel)
+        BackHandler(enabled = true, onBack = onCancel)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -181,18 +196,55 @@ fun QuickStreamSheet(
                     color = CinemaColors.Primary,
                     trackColor = CinemaColors.SurfaceBright,
                 )
+                val connectedPeers = torrent?.numPeers ?: 0
                 val statusText = when {
                     busy -> "Iniciando streaming Direct Play en memoria…"
                     torrent?.ready == true -> "Metadatos listos, preparando reproductor…"
                     sourceStatus != null -> sourceStatus
-                    (torrent?.numPeers ?: 0) > 0 -> "Conectado con ${torrent?.numPeers} peers · leyendo lista de archivos…"
-                    else -> "Buscando peers en la red BitTorrent…"
+                    connectedPeers > 0 -> "Conectado con $connectedPeers conectados · leyendo lista de archivos…"
+                    else -> "Buscando fuentes en la red BitTorrent…"
                 }
                 Text(
                     text = statusText,
                     style = MaterialTheme.typography.bodyMedium.tabular(),
                     color = CinemaColors.TextSecondary,
                 )
+                val telemetryLine = buildList {
+                    target?.reportedSeeders?.let { s -> add("$s fuentes reportadas") }
+                    add("$connectedPeers conectados")
+                    val speed = torrent?.downloadSpeed ?: 0L
+                    add("↓ ${formatSpeed(speed)}")
+                    if (draft?.startedAtMs != null) add("${elapsedSec}s")
+                }.joinToString(" · ")
+                Text(
+                    text = telemetryLine,
+                    style = MaterialTheme.typography.bodySmall.tabular(),
+                    color = CinemaColors.TextSecondary,
+                )
+                if (draft?.startedAtMs != null && elapsedSec >= 12 && connectedPeers == 0) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = CinemaColors.Secondary.copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, CinemaColors.Secondary.copy(alpha = 0.4f)),
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = "Sin fuentes conectadas aún — puede estar inactivo",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = CinemaColors.TextPrimary,
+                            )
+                            Button(
+                                onClick = onCancel,
+                                modifier = Modifier.fillMaxWidth().height(44.dp),
+                            ) {
+                                Text("Elegir otra fuente")
+                            }
+                        }
+                    }
+                }
             }
 
             Row(
@@ -210,7 +262,7 @@ fun QuickStreamSheet(
                 }
                 OutlinedButton(
                     onClick = onCancel,
-                    enabled = !busy,
+                    enabled = true,
                     modifier = Modifier.weight(1f).height(46.dp),
                 ) {
                     Text("Cancelar", maxLines = 1)
@@ -238,13 +290,18 @@ fun ChooseFilesOverlay(
     onDownload: () -> Unit,
     onRetry: () -> Unit,
     onCancel: () -> Unit,
+    onPlayFile: ((Int) -> Unit)? = null,
+    target: QuickStreamTarget? = null,
+    cachedProbe: SwarmProbeResult? = null,
+    onMeasureSwarm: (() -> Unit)? = null,
 ) {
     val busy = draft?.busy == true
-    BackHandler(enabled = !busy, onBack = onCancel)
+    BackHandler(enabled = true, onBack = onCancel)
 
     val torrent = draft?.torrent
     val ready = torrent?.ready == true
     val files = torrent?.files.orEmpty()
+    val videos = remember(files) { files.filter { it.name.isVideoName() || it.path.isVideoName() } }
     val selection = draft?.selected.orEmpty()
     val selectedBytes = files.filter { it.index in selection }.sumOf { it.length }
     var query by rememberSaveable(draft?.engineId) { mutableStateOf("") }
@@ -260,7 +317,7 @@ fun ChooseFilesOverlay(
     val draftEntryKey = draftEngineId?.let { "prepare:$it" }
 
     LaunchedEffect(ready, draftEngineId, draftInfoHash, files.size) {
-        if (!ready || draftEngineId.isNullOrBlank()) return@LaunchedEffect
+        if (!ready || draftEngineId.isNullOrBlank() || videos.size > 1) return@LaunchedEffect
         files.filter { isInspectableContainerName(it.name) && it.length > 0L }
             .take(3)
             .forEach { file ->
@@ -315,7 +372,7 @@ fun ChooseFilesOverlay(
                     }
                 },
                 actions = {
-                    IconButton(onClick = onCancel, enabled = !busy) {
+                    IconButton(onClick = onCancel, enabled = true) {
                         Icon(Icons.Default.Close, contentDescription = "Cerrar")
                     }
                 },
@@ -366,7 +423,7 @@ fun ChooseFilesOverlay(
                             ) {
                                 Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Ver ahora (Direct Play · sin guardar)", maxLines = 1)
+                                Text("Reproducir ahora (sin guardar)", maxLines = 1)
                             }
                             OutlinedButton(
                                 onClick = onDownload,
@@ -375,7 +432,7 @@ fun ChooseFilesOverlay(
                             ) {
                                 Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Descargar para ver sin conexión", maxLines = 1)
+                                Text("Descargar en el teléfono", maxLines = 1)
                             }
                         } else {
                             Button(
@@ -385,7 +442,7 @@ fun ChooseFilesOverlay(
                             ) {
                                 Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Descargar para ver sin conexión", maxLines = 1)
+                                Text("Descargar en el teléfono", maxLines = 1)
                             }
                             OutlinedButton(
                                 onClick = onDirectPlay,
@@ -394,7 +451,7 @@ fun ChooseFilesOverlay(
                             ) {
                                 Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Ver ahora (Direct Play · sin guardar)", maxLines = 1)
+                                Text("Reproducir ahora (sin guardar)", maxLines = 1)
                             }
                         }
                     }
@@ -441,6 +498,17 @@ fun ChooseFilesOverlay(
                                 else -> "Buscando peers en la red DHT…"
                             }
                             Text(waitLabel, style = MaterialTheme.typography.bodySmall.tabular(), color = CinemaColors.TextSecondary)
+                            val peers = torrent?.numPeers ?: 0
+                            val telemetryLine = buildList {
+                                target?.reportedSeeders?.let { s -> add("$s fuentes reportadas") }
+                                add("$peers conectados")
+                                add("↓ ${formatSpeed(torrent?.downloadSpeed ?: 0L)}")
+                            }.joinToString(" · ")
+                            Text(
+                                text = telemetryLine,
+                                style = MaterialTheme.typography.bodySmall.tabular(),
+                                color = CinemaColors.TextSecondary,
+                            )
                             OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth().height(44.dp)) {
                                 Text("Cancelar")
                             }
@@ -475,6 +543,22 @@ fun ChooseFilesOverlay(
             item(key = "preview") {
                 draft?.let { DraftVideoPreview(it) }
             }
+            if (videos.size > 1) {
+                item(key = "multi_video_banner") {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = CinemaColors.PrimaryMuted.copy(alpha = 0.25f),
+                        border = BorderStroke(1.dp, CinemaColors.Primary.copy(alpha = 0.35f)),
+                    ) {
+                        Text(
+                            text = "Este torrent tiene ${videos.size} videos. Toca ▶ para ver uno al instante o marca para descargar:",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = CinemaColors.TextPrimary,
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        )
+                    }
+                }
+            }
             item(key = "header_controls") {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
@@ -487,6 +571,44 @@ fun ChooseFilesOverlay(
                         style = MaterialTheme.typography.bodyMedium.tabular(),
                         color = CinemaColors.TextSecondary,
                     )
+                    val peers = torrent.numPeers
+                    val measuredBps = cachedProbe?.measuredDownloadBps?.takeIf { it > 0L }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        val telemetryLine = buildList {
+                            target?.reportedSeeders?.let { s -> add("$s fuentes reportadas") }
+                            if (measuredBps != null) {
+                                add("$peers conectados")
+                                add("↓ ${formatSpeed(measuredBps)}")
+                            } else {
+                                add("$peers conectados · Listo")
+                            }
+                        }.joinToString(" · ")
+                        Text(
+                            text = telemetryLine,
+                            style = MaterialTheme.typography.bodySmall.tabular(),
+                            color = if (measuredBps != null) CinemaColors.Secondary else CinemaColors.TextSecondary,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        if (measuredBps == null && onMeasureSwarm != null) {
+                            Surface(
+                                onClick = onMeasureSwarm,
+                                shape = RoundedCornerShape(7.dp),
+                                color = CinemaColors.Gold.copy(alpha = 0.16f),
+                                border = BorderStroke(1.dp, CinemaColors.Gold.copy(alpha = 0.42f)),
+                            ) {
+                                Text(
+                                    text = "⚡ Medir",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CinemaColors.Gold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                )
+                            }
+                        }
+                    }
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -533,6 +655,7 @@ fun ChooseFilesOverlay(
             }
             items(visibleFiles, key = { it.index }) { file ->
                 val checked = file.index in selection
+                val isVideo = file.name.isVideoName() || file.path.isVideoName()
                 val fileProbe = AudioTrackProbeRepository.lookupFromMap(probesMap, draftEntryKey, draftInfoHash, file.index)
                 val fileProbing = draftEntryKey != null && AudioTrackProbeRepository.entryKey(draftEntryKey, file.index) in probingKeys
                 val canInspectFile = isInspectableContainerName(file.name) && !draftEngineId.isNullOrBlank() && file.length > 0L
@@ -574,6 +697,37 @@ fun ChooseFilesOverlay(
                                     style = MaterialTheme.typography.bodySmall.tabular(),
                                     color = CinemaColors.TextSecondary,
                                 )
+                                if (isVideo) {
+                                    val reqMbps = remember(file.length) {
+                                        PlayabilityScorer.estimateVideoRequiredMbps(file.length)
+                                    }
+                                    if (reqMbps != null && reqMbps > 0.0) {
+                                        val swarmMbps = cachedProbe?.measuredDownloadBps
+                                            ?.takeIf { it > 0L }
+                                            ?.let { (it * 8.0) / 1_000_000.0 }
+                                            ?: torrent.downloadSpeed
+                                                .takeIf { it > 0L }
+                                                ?.let { (it * 8.0) / 1_000_000.0 }
+                                        val reqColor = when {
+                                            swarmMbps == null -> CinemaColors.TextSecondary
+                                            swarmMbps >= reqMbps * 1.5 -> CinemaColors.Secondary
+                                            swarmMbps >= reqMbps -> CinemaColors.Gold
+                                            else -> CinemaColors.Danger
+                                        }
+                                        Surface(
+                                            shape = RoundedCornerShape(7.dp),
+                                            color = reqColor.copy(alpha = 0.14f),
+                                            border = BorderStroke(1.dp, reqColor.copy(alpha = 0.35f)),
+                                        ) {
+                                            Text(
+                                                text = "Req ~${String.format(Locale.US, "%.1f", reqMbps / 8.0)} MB/s",
+                                                style = MaterialTheme.typography.labelSmall.tabular(),
+                                                color = reqColor,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                            )
+                                        }
+                                    }
+                                }
                                 if (fileProbe != null || fileProbing) {
                                     VerifiedAudioSummaryPill(
                                         probe = fileProbe,
@@ -624,6 +778,18 @@ fun ChooseFilesOverlay(
                                         }
                                     }
                                 }
+                            }
+                        }
+                        if (isVideo && onPlayFile != null) {
+                            IconButton(
+                                onClick = { onPlayFile(file.index) },
+                                enabled = !busy,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PlayArrow,
+                                    contentDescription = "Reproducir",
+                                    tint = CinemaColors.PrimarySoft,
+                                )
                             }
                         }
                     }
